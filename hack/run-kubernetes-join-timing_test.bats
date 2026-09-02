@@ -14,9 +14,6 @@ kubectl() {
     *"get nodes"*)
       printf '%b\n' 'worker-a\tcreated=2026-08-27T13:51:45Z\tReady=2026-08-27T13:52:03Z'
       ;;
-    *"logs deploy/talos-image-cache"*)
-      printf '%s\n' '2026-08-27T13:51:01Z transfer-finished status=complete path=/image/openstack-amd64.raw.xz range=0-123/124 requested=124 sent=124 duration=0.432s'
-      ;;
     *)
       return 1
       ;;
@@ -36,12 +33,12 @@ assert_contains() {
   return 1
 }
 
-@test "successful join report separates wait, lifecycle and image transfer timing" {
+@test "successful join report separates wait and worker lifecycle timing" {
   # shellcheck source=/dev/null
   . hack/e2e-chainsaw/_lib/run-kubernetes.sh
 
   output=$(cozy_report_node_join_timing \
-    test-latest-version tenant-kubeconfig 100 140 345 2026-08-27T13:48:00Z)
+    test-latest-version tenant-kubeconfig 100 140 345)
 
   assert_contains "$output" 'worker-pool request -> Ready wait: 40s'
   assert_contains "$output" 'two-node Ready wait: 205s'
@@ -53,7 +50,6 @@ assert_contains() {
   assert_contains "$output" 'Successfully pulled image in 3.355s'
   expected=$(printf 'worker-a\tcreated=2026-08-27T13:51:45Z\tReady=2026-08-27T13:52:03Z')
   assert_contains "$output" "$expected"
-  assert_contains "$output" 'duration=0.432s'
 }
 
 @test "worker timing starts immediately before the KubernetesNodes request" {

@@ -45,6 +45,12 @@ spec:
         bundles:
           enabledPackages:
             - cozystack.external-dns-application
+            # Golden Talos worker image catalog: the kubernetes suites set the
+            # worker pool's osImage.builtin, so workers CDI-clone the golden in
+            # cozy-public instead of each importing the OS image over HTTP.
+            # Enabled here so the clone path the chart ships is exercised
+            # end-to-end and not only in unit tests.
+            - cozystack.kubernetes-worker-image
 EOF
 
 if [ "$linstor_drbd_enabled" = false ]; then

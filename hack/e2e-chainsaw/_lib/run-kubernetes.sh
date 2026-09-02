@@ -1,7 +1,6 @@
 # shellcheck shell=bash
 # Sourced by the chainsaw kubernetes-latest/previous Tests after cd to repo root.
 . hack/e2e-chainsaw/_lib/remediation-guard.sh
-. hack/e2e-chainsaw/_lib/talos-image-cache.sh
 
 # The QEMU lane exercises replicated DRBD storage. The container lane cannot
 # represent three DRBD nodes on one shared kernel, so its otherwise-identical
@@ -17,23 +16,14 @@ cozy_e2e_storage_class() {
   esac
 }
 
-# talos_spec_block: emit the tenant Kubernetes CR `spec.talos` block with the Talos
-# OS image cache (imageFactoryURL) when the in-sandbox cache is up. Prints nothing
-# when it falls back to the public default, so the chart default applies.
-# Indented for insertion directly under `spec:` in the heredoc below.
-#
-# No trailing newline, unlike the single-key helper this replaced: the caller reads
-# it through `$(...)`, which strips one anyway, and `${talos_block}` sits on a line
-# of its own in the heredoc, which supplies the break before the next `spec` key.
-# An empty result therefore leaves a blank line, which is valid YAML.
-talos_spec_block() {
-  local url
-  url=$(resolve_talos_image_factory_url)
-  [ -n "$url" ] || return 0
-  printf '  talos:\n'
-  printf '    imageFactoryURL: %s\n' "$url"
-  return 0
-}
+# There is no talos_spec_block here any more, and the absence is worth a sentence
+# because it used to be the composition point two mirrors fed. Both are gone. The
+# ghcr.io pull-through went with the hypothesis it rested on (the node-join stall
+# tracks the host kvm_amd vgif flag, not registry egress -- cozystack/cozystack#3513),
+# and the Talos OS image cache is superseded here: the worker pool boots by
+# CDI-cloning the golden Talos image seeded in cozy-public, so no worker fetches the
+# raw image over HTTP and there is nothing left to redirect. Neither tenant CR
+# carries a spec.talos override now; both take the chart defaults.
 
 # kubectl_wait_retry: wraps `kubectl wait` with retries against transient
 # management-cluster apiserver/etcd errors.
@@ -4135,9 +4125,15 @@ COZY_DIAG_RATE_INTERVAL_DEFAULT=12
 # answers to, and raising the budget without raising the operation moves the
 # snapshot past the end of the window.
 #
-# What a budget of this size gives up first is what is gated last -- the
-# talos_image_cache_diagnose re-probe. It has no substitute, but it is also the
-# heaviest late collector because it creates a Pod and waits on curl retries.
+# What a budget of this size gives up first is what is gated last --
+# the guest Talos capture at (b). It does not lose its subject entirely -- the
+# console stream at (d) covers the same window from outside the guest -- but it
+# is the only read that reaches inside a worker that never registered, so what a
+# short budget costs here is the shape of the failure rather than a duplicate of
+# it. This tail used to hold two mirror diagnostics, a ghcr-mirror dump and a
+# talos-image-cache re-probe; both mirrors are gone, and the one piece of state
+# that replaced them, the golden image in cozy-public, is read at (a2) inside the
+# budget rather than at its mercy.
 #
 # Only part of what runs ahead of the console is held mechanically, and the
 # boundary is worth naming rather than leaving a reader to trust the whole of
@@ -4242,9 +4238,9 @@ COZY_CANARY_RUN_BOUND=$(_cozy_diag_seconds "${COZY_CANARY_RUN_BOUND:-$COZY_CANAR
 # figure the budget was derived against. Nor does it cover the collectors with no
 # wall-clock bound at all. On the guest-Talos path the applies, waits and deletes
 # carry `--request-timeout`/`--timeout`, which bounds one HTTP request rather than
-# a client retrying against a wedged apiserver, and the image-cache re-probe makes
-# unbounded calls of its own. Both are tracked in cozystack/cozystack#3666. So no
-# worst case is claimed here, and none can be stated while that holds.
+# a client retrying against a wedged apiserver. That is tracked in
+# cozystack/cozystack#3666. So no worst case is claimed here, and none can be
+# stated while that holds.
 #
 # What the budget buys, exactly and only, is that no collector is STARTED once it
 # is spent, so the snapshot is never queued behind work begun past the deadline.
@@ -4255,7 +4251,7 @@ COZY_CANARY_RUN_BOUND=$(_cozy_diag_seconds "${COZY_CANARY_RUN_BOUND:-$COZY_CANAR
 # the phase to its budget exactly, and would also decline the guest-Talos capture
 # on a merely slow run, throwing away the only in-guest evidence to protect a
 # snapshot that was not yet in danger. Start-gating leaves that to the cheap-first
-# order below, and the image-cache diagnosis is the collector this budget gives up
+# order below, and the guest-Talos capture is the collector this budget gives up
 # first, which is worth knowing before its dumps are relied on.
 COZY_DIAG_PHASE_BUDGET=$(_cozy_diag_seconds "${COZY_DIAG_PHASE_BUDGET:-$COZY_DIAG_PHASE_BUDGET_DEFAULT}" "$COZY_DIAG_PHASE_BUDGET_DEFAULT" COZY_DIAG_PHASE_BUDGET)
 # Zero until a phase opens, which is how the scheduling-gate branch -- two reads,
@@ -4271,7 +4267,7 @@ _COZY_DIAG_PHASE_DEADLINE=0
 cozy_diag_phase_start() {
   # Said once, here, rather than letting a dozen notes imply it, and said narrowly
   # because the phase is not uniform. The reads that go through cozy_diag_read, the
-  # importer listing and the image-cache helper fall back to running unbounded, since
+  # importer listing included, fall back to running unbounded, since
   # bounding with a binary that is not there would turn each of them into an exit 127
   # and each note into "read failed" -- a missing local dependency reported as the
   # cluster refusing. Unbounded is what this path had before any of this, so a partial
@@ -4293,7 +4289,7 @@ cozy_diag_phase_start() {
   # an unchecked list sitting beside a checked one, drifting from it at whatever
   # rate collectors are added.
   command -v timeout >/dev/null 2>&1 || \
-    echo "» WARNING: timeout is not on PATH; the bounded reads below run UNBOUNDED, so one that hangs can still take the op and the tenant snapshot with it, and the collectors that call timeout directly (wedge check, serial console, guest Talos) exit 127 and collect nothing; the ones that guard the call with command -v -- the worker CPU throttling, worker network counter, worker block IO counter, sandbox node CPU time, sandbox kernel KVM counters, runner kernel CPU time, sandbox QEMU per-thread CPU time, runner fixed-work canary, worker per-thread CPU time and talos-image-cache capture -- keep collecting instead, unbounded" >&2
+    echo "» WARNING: timeout is not on PATH; the bounded reads below run UNBOUNDED, so one that hangs can still take the op and the tenant snapshot with it, and the collectors that call timeout directly (wedge check, serial console, guest Talos) exit 127 and collect nothing; the ones that guard the call with command -v -- the worker CPU throttling, worker network counter, worker block IO counter, sandbox node CPU time, sandbox kernel KVM counters, runner kernel CPU time, sandbox QEMU per-thread CPU time, runner fixed-work canary and worker per-thread CPU time -- keep collecting instead, unbounded" >&2
   # Re-checked here, not only at assignment: a value set after this file is sourced
   # -- which is how a test sets it -- would otherwise reach the arithmetic below
   # unvalidated, and that is the one failure that costs the whole block.
@@ -4541,18 +4537,24 @@ cozy_report_node_join_failure() {
   cozy_diag_read 'virt-launcher Pod detail' \
     kubectl -n tenant-test describe pods -l kubevirt.io=virt-launcher "${request_timeout}"
 
-  # (a2) Worker DataVolume IMPORT stage. A VM stuck "Provisioning" whose
-  # DataVolume is ImportInProgress at N/A progress with the importer pod
-  # looping on an HTTP error is a distinct sub-mode of 2a that the VM/VMI
-  # state alone does not show: the OS image never finishes importing, so the
-  # VM never boots. This is what took out PR #2826's CI — the CDI importer
-  # could not reach the talos-image-cache ClusterIP (`dial tcp <svc>:80: i/o
-  # timeout`) even though the cache pod was healthy. Show the DataVolume/PVC
-  # phases and the importer pod logs here; the cache ClusterIP re-probe that tells
-  # "cache path went dead mid-run" apart from "upstream factory slow/flaky" belongs
-  # to this section too, but it creates a Pod and waits on curl, so it sits with
-  # the other minute-scale collectors further down rather than here.
-  echo "=== (a2) tenant worker DataVolume import stage (management cluster, ns tenant-test) ==="
+  # (a2) Worker DataVolume boot-disk stage. A VM stuck "Provisioning" whose
+  # disk-system DataVolume never reaches Succeeded is a distinct sub-mode of 2a
+  # that the VM/VMI state alone does not show: the OS disk never populates, so the
+  # VM never boots.
+  #
+  # These suites set the worker pool's image.builtin, so a worker disk is a CDI
+  # CLONE of the golden Talos image in cozy-public
+  # (packages/system/kubernetes-worker-image) rather than a per-worker HTTP import.
+  # The usual culprit is therefore a clone blocked on a golden that has not
+  # finished importing, which is why the golden's own DataVolume/PVC is dumped
+  # alongside the worker ones below.
+  #
+  # The importer-Pod walk further down stays, but read its result with that in
+  # mind: on the clone path there is no importer Pod in tenant-test and "matched
+  # none" is the healthy state, not a finding. An importer-* Pod appearing at all
+  # means the pool fell back to the HTTP import, and its log then carries the
+  # factory error.
+  echo "=== (a2) tenant worker DataVolume boot-disk stage (management cluster) ==="
   # The two greps keep these dumps readable. kubectl's stderr is no longer folded
   # into them: `2>&1 | grep` sent a refusal into the filter, which dropped it for
   # not matching, so a read that never happened looked the same as one that found
@@ -4563,6 +4565,12 @@ cozy_report_node_join_failure() {
   cozy_diag_read 'worker DataVolume detail' \
     kubectl -n tenant-test describe datavolume "${request_timeout}" \
     | grep -Ei 'Name:|Phase:|Progress:|Restart|Reason:|Message:|Running Condition|Bound Condition' || true
+  # The clone SOURCE. A worker clone sits pending indefinitely while its golden is
+  # still importing, so a worker DataVolume that never leaves Pending means nothing
+  # until this read says whether the golden reached Succeeded.
+  cozy_diag_read 'golden Talos worker image (clone source, ns cozy-public)' \
+    kubectl -n cozy-public get datavolume,pvc -o wide "${request_timeout}" \
+    | grep -E 'NAME|talos-worker' || true
 
   # The listing is read on its own rather than inline in the `for`, so a listing
   # that never answered stays distinguishable from a namespace with no importer
@@ -4860,15 +4868,6 @@ cozy_report_node_join_failure() {
     echo "=== (b) in-guest Talos dmesg + kubelet logs + service states + links ==="
     cozy_capture_tenant_talos "${test_name}" || true
   fi
-
-  # Last, and gated on the phase as well as bounded per read, because it is the
-  # collector that most needs both: its reachability re-probe creates a Pod, waits
-  # on curl retries, and makes seven unbounded management-cluster calls of its own,
-  # so it has no ceiling here at all.
-  if cozy_diag_phase_has_time 're-probe talos-image-cache ClusterIP + cacher debug bundle'; then
-    echo "--- re-probe talos-image-cache ClusterIP + cacher debug bundle ---"
-    talos_image_cache_diagnose || true
-  fi
 }
 
 # Whether a non-zero from the node-join wait is the deadline expiring.
@@ -4932,19 +4931,19 @@ cozy_note_node_join_deadline() {
 # and Events still exist. The top-level durations distinguish time spent before
 # the Ready poll from the poll itself. The event timeline then exposes PVC
 # placement, CDI scratch provisioning, importer/virt-launcher image pulls, the
-# Talos disk import, VM start and CAPI NodeRef assignment without adding waits to
-# the product path. Finally, the cache log reports how long serving the compressed
-# OS image bytes took; DataVolume ImportInProgress -> Completed includes the
-# separate decompression and block-write work and must not be called pull time.
+# Talos disk population, VM start and CAPI NodeRef assignment without adding waits
+# to the product path. There is no compressed-byte service time to report beside
+# them any more: these pools clone the golden in the storage layer, so nothing
+# streams the OS image over HTTP per worker and DataVolume Pending -> Succeeded is
+# the whole of the disk's own cost.
 cozy_report_node_join_timing() {
   local test_name="$1"
   local tenant_kubeconfig="$2"
   local worker_requested_at="$3"
   local wait_started_at="$4"
   local wait_finished_at="$5"
-  local suite_started_at="$6"
   local prefix="kubernetes-${test_name}-md0"
-  local event_rows event_rc=0 node_rows node_rc=0 cache_rows cache_rc=0
+  local event_rows event_rc=0 node_rows node_rc=0
 
   echo "=== successful tenant worker join timing: ${test_name} ==="
   printf 'worker-pool request -> Ready wait: %ss\n' "$(( wait_started_at - worker_requested_at ))"
@@ -4996,24 +4995,6 @@ cozy_report_node_join_timing() {
     printf '%s\n' "$node_rows" | sed 's/^/  node-read: /'
   fi
 
-  if command -v timeout >/dev/null 2>&1; then
-    cache_rows=$(timeout -k 5 25 kubectl -n kube-system logs deploy/talos-image-cache \
-      -c serve --since-time="$suite_started_at" --timestamps=true \
-      --request-timeout=20s 2>&1) || cache_rc=$?
-  else
-    cache_rows=$(kubectl -n kube-system logs deploy/talos-image-cache \
-      -c serve --since-time="$suite_started_at" --timestamps=true \
-      --request-timeout=20s 2>&1) || cache_rc=$?
-  fi
-  echo "Talos OS cache transfers since suite start (compressed-byte service time, not CDI decompression/write time):"
-  if [ "$cache_rc" -ne 0 ]; then
-    echo "  not collected: talos-image-cache log read exited ${cache_rc}"
-    printf '%s\n' "$cache_rows" | sed 's/^/  cache-log-read: /'
-  elif printf '%s\n' "$cache_rows" | grep -F 'transfer-finished' | grep -Fq 'openstack-amd64.raw.xz'; then
-    printf '%s\n' "$cache_rows" | grep -F 'transfer-finished' | grep -F 'openstack-amd64.raw.xz' | sed 's/^/  /'
-  else
-    echo "  no openstack-amd64.raw.xz transfer outcome was logged (mirror fallback or a pre-instrumentation cache pod)"
-  fi
   return 0
 }
 
@@ -5043,8 +5024,6 @@ run_kubernetes_test() {
   # be prevented from turning a green run red is to know how long this has been
   # running. Nothing else reads it.
   _COZY_RUN_STARTED_AT=$(date +%s)
-  local _cozy_run_started_rfc3339
-  _cozy_run_started_rfc3339=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 
   # Clean up stale resources from a previous failed run. Delete the worker pool
   # (KubernetesNodes) before the parent Kubernetes CR so a rerun re-creates the
@@ -5107,12 +5086,27 @@ YAML
 )
   fi
 
-  # Point worker DataVolume imports at the in-sandbox Talos OS image cache when it
-  # is up, falling back to the public factory otherwise. Worker image pulls use
-  # the chart's public-registry default. Emitted right under spec: as
-  # `talos: { imageFactoryURL: ... }`, or nothing when the default applies.
-  local talos_block
-  talos_block=$(talos_spec_block)
+  # The kubernetes-worker-image catalog imports the golden Talos worker image into
+  # cozy-public once; the md0 pool below clones it (image.builtin), which is what
+  # gives the clone path end-to-end coverage rather than unit coverage alone.
+  # Wait for that one import to finish here: a factory stall then surfaces as a
+  # clear, self-contained failure with the factory in the message, instead of an
+  # opaque node-join timeout downstream, and the KubernetesNodes render (which
+  # fails when the golden is absent) is guaranteed a created source. The catalog
+  # HR is already Ready (install gate), so this waits only for the import phase to
+  # reach Succeeded.
+  echo "--- waiting for the golden Talos worker image(s) in cozy-public to import ---"
+  # Capture the DataVolume list inside the until condition and reuse it for the
+  # wait, so a transient get between "exists" and "wait" cannot skip the import
+  # check with an empty list.
+  timeout 12m sh -ec '
+    until dvs=$(kubectl -n cozy-public get datavolume -o name 2>/dev/null | grep talos-worker-); [ -n "$dvs" ]; do
+      echo "golden DataVolume not created yet; waiting..."; sleep 5
+    done
+    for dv in $dvs; do
+      echo "waiting for $dv import (phase=Succeeded)..."
+      kubectl -n cozy-public wait "$dv" --for=jsonpath="{.status.phase}"=Succeeded --timeout=10m
+    done'
 
   kubectl apply -f - <<EOF
 apiVersion: apps.cozystack.io/v1alpha1
@@ -5121,7 +5115,6 @@ metadata:
   name: "${test_name}"
   namespace: tenant-test
 spec:
-${talos_block}
 ${oidc_block}
   addons:
     certManager:
@@ -5186,9 +5179,14 @@ metadata:
   namespace: tenant-test
 spec:
   cluster: "${test_name}"
-${talos_block}
   diskSize: 20Gi
   gpus: []
+  # Boot workers by CDI-cloning the shared golden Talos image in cozy-public
+  # (kubernetes-worker-image catalog, enabled in e2e-install-cozystack.bats)
+  # instead of a per-worker HTTP import -- this exercises the clone path and the
+  # #3231 mitigation. builtin: {} clones the pool talos.* default golden.
+  image:
+    builtin: {}
   # Sizing comes from resources below; this is here because the values
   # schema requires the field, and the chart drops the instancetype from
   # the VM whenever a pool sets both resources.cpu and resources.memory.
@@ -5463,8 +5461,7 @@ EOF
     "tenantkubeconfig-${test_name}" \
     "$_worker_pool_requested_at" \
     "$_join_wait_started_at" \
-    "$_join_wait_finished_at" \
-    "$_cozy_run_started_rfc3339" || true
+    "$_join_wait_finished_at" || true
 
   # Verify the kubelet version matches what we expect
   versions=$(kubectl --kubeconfig "tenantkubeconfig-${test_name}" \
@@ -5541,10 +5538,9 @@ EOF
 
   # Backend 1
   #
-  # nginx is pinned by digest. The tenant workers reach no registry mirror --
-  # hack/e2e-talos-image-cache.yaml serves the Talos worker OS disk image over
-  # HTTP and is not one, and nothing else in the tree mirrors container images
-  # for a tenant -- so this is pulled from Docker Hub on every run either way.
+  # nginx is pinned by digest. The tenant workers reach no registry mirror at all
+  # -- nothing in the tree mirrors a container registry for a tenant any more --
+  # so this is pulled from Docker Hub on every run either way.
   # The digest does not remove that pull, it fixes what the pull returns: a
   # floating `nginx:alpine` silently changes size and layer count under the
   # readiness budget below, and supplies whatever content the tag points at on
