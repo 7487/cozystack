@@ -9,9 +9,19 @@ include ../../../hack/package.mk
 test:
 	helm unittest .
 
+# Nothing under templates/ here is purely vendored. The upload-proxy Ingress
+# and TLSRoute are ours and no fetch recreates them, so clearing the directory
+# loses them outright, which is why the removal is gone: wget -O truncates the
+# one file it writes and leaves the rest.
+#
+# cdi-cr.yaml is ours too, despite being named after an upstream asset: it
+# carries Helm templating, the ExpandDisks gate, a toleration, and the two RBAC
+# documents that preauthorize cloning from cozy-public. The fetch below still
+# overwrites it, so a CDI bump still means re-applying all of that by hand.
+# Removing the wipe does not fix that, and this recipe should not be read as
+# leaving the directory alone.
 update:
-	rm -rf templates
-	mkdir templates
+	mkdir -p templates
 	export VERSION=$$(basename $$(curl -s -w %{redirect_url} https://github.com/kubevirt/containerized-data-importer/releases/latest)) && \
 	wget https://github.com/kubevirt/containerized-data-importer/releases/download/$$VERSION/cdi-cr.yaml -O templates/cdi-cr.yaml
 
