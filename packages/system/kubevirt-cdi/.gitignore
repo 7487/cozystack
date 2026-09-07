@@ -1,0 +1,3 @@
+# `update` fetches here to check the pin. The file is removed once it has
+# matched, and deliberately kept when it has not so the mismatch can be read.
+cdi-cr.yaml.download

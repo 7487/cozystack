@@ -1,0 +1,97 @@
+suite: cozy-kubevirt-cdi local templates
+release:
+  name: kubevirt-cdi
+  namespace: cozy-kubevirt-cdi
+# helm-unittest renders the whole chart for every test, so both upload-proxy
+# routes are evaluated even by a test that names neither. Neither emits a
+# document without a root-host and a matching expose-services entry, so without
+# these values the route cases fail on "no manifest found" rather than on the
+# assertion they are about. tests/standalone_render_test.yaml covers the
+# opposite case, that the chart renders with nothing injected at all.
+set:
+  _cluster:
+    root-host: example.com
+    expose-services: cdi-uploadproxy
+    gateway-enabled: "false"
+tests:
+  # Upstream's cdi-cr.yaml carries none of this.
+  - it: keeps the local additions to the CDI object
+    template: cdi-cr.yaml
+    documentSelector:
+      path: kind
+      value: CDI
+      matchMany: false
+    asserts:
+      # Without the override CDI falls back to a host-assisted copy per VM.
+      - equal:
+          path: spec.cloneStrategyOverride
+          value: csi-clone
+      - contains:
+          path: spec.config.featureGates
+          content: ExpandDisks
+      - contains:
+          path: spec.infra.tolerations
+          content:
+            key: CriticalAddonsOnly
+            operator: Exists
+
+  # The default is the empty string, so the block renders nothing and an
+  # assertion on the default value would pass against a template that had
+  # stopped rendering the block. Setting it is what makes this able to fail.
+  - it: renders the upload-proxy URL override when one is set
+    template: cdi-cr.yaml
+    documentSelector:
+      path: kind
+      value: CDI
+      matchMany: false
+    set:
+      uploadProxyURL: https://cdi-uploadproxy.example.com
+    asserts:
+      - equal:
+          path: spec.config.uploadProxyURLOverride
+          value: https://cdi-uploadproxy.example.com
+
+  # What lets a tenant service account clone from the golden-image namespace.
+  # `any: true` on both: a bare containsDocument holds every document in the
+  # template to the match, and this template renders three.
+  - it: keeps the golden-image clone RBAC
+    template: cdi-cr.yaml
+    asserts:
+      - containsDocument:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: ClusterRole
+          name: cdi-copy-dv
+          any: true
+      - containsDocument:
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          name: cdi-clone-dv
+          namespace: cozy-public
+          any: true
+
+  # Addressed as a `template:` because helm-unittest fails outright on one it
+  # cannot find, which makes a deleted file loud rather than a smaller render.
+  - it: renders the upload-proxy Ingress when the gateway is off
+    template: cdi-uploadproxy-ingress.yaml
+    asserts:
+      - equal:
+          path: spec.rules[0].host
+          value: cdi-uploadproxy.example.com
+      - equal:
+          path: metadata.annotations["nginx.ingress.kubernetes.io/ssl-passthrough"]
+          value: "true"
+
+  - it: renders the upload-proxy TLSRoute when the gateway is on
+    template: cdi-uploadproxy-tlsroute.yaml
+    set:
+      _cluster:
+        root-host: example.com
+        expose-services: cdi-uploadproxy
+        gateway-enabled: "true"
+    asserts:
+      - equal:
+          path: spec.hostnames[0]
+          value: cdi-uploadproxy.example.com
+      - equal:
+          path: spec.parentRefs[0].sectionName
+          value: tls-cdi-uploadproxy
