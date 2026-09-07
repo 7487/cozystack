@@ -463,12 +463,19 @@ gateway:
   #     that attaches to the root tenant's Gateway, so Certificate issuance
   #     works for tenants whose ingress is via Gateway API rather than
   #     ingress-nginx.
-  #   - Exposed services (dashboard, keycloak, harbor, bucket, grafana,
-  #     cozystack-api, vm-exportproxy, cdi-uploadproxy) render an
-  #     HTTPRoute attached to the tenant's Gateway.
+  #   - Exposed services whose TLS the Gateway terminates (dashboard,
+  #     keycloak, harbor, bucket, grafana) render an HTTPRoute attached to
+  #     the tenant's Gateway.
+  #   - The three that present a certificate of their own (api,
+  #     vm-exportproxy, cdi-uploadproxy) render a TLSRoute instead, pinned
+  #     by sectionName to the tls-<name> TLS-passthrough listener the
+  #     per-tenant gateway chart declares for it. The cozystack-api,
+  #     kubevirt and kubevirt-cdi packages ship one each, cluster-wide,
+  #     attached to the Gateway in the namespace publishing.ingressName
+  #     selects.
   # Per-tenant opt-in is still governed by tenant.spec.gateway=true, which
   # materialises the Gateway itself. This flag only controls platform-wide
-  # Gateway API integration (cert-manager solver + per-service HTTPRoutes).
+  # Gateway API integration (cert-manager solver + the per-service routes).
   enabled: false
   # Default GatewayClass for tenant Gateways. A tenant picks another one
   # with `gatewayClass` on its Tenant resource; this is the value used when
