@@ -1,8 +1,8 @@
-# Chainsaw port of hack/e2e-apps/kubernetes-oidc-customconfig.bats.
-#
-# Phase-1 OIDC CustomConfig selector e2e — render-side only. Pairs with the
-# kubernetes-oidc-system suite; see its header for why no Kamaji bringup and
-# no HR Ready wait (minReplicas: 0, HR asserted to exist only).
+# Phase-1 OIDC CustomConfig selector e2e — the rendered control plane and the
+# tenant-supplied issuer, with no worker bringup. Not "render-side only": the
+# last step waits for the release to finish installing, which requires a serving
+# tenant control plane. See the kubernetes-oidc-system suite's header for why
+# that wait is there and why it is affordable.
 #
 # What is exercised on a live cluster: spec.oidc.mode: CustomConfig is
 # admitted; the HelmRelease renders; the tenant-supplied
@@ -21,15 +21,46 @@ metadata:
   name: kubernetes-oidc-customconfig
 spec:
   catch:
-  - events: {}
+  - events:
+      timeout: 1m
   - describe:
+      timeout: 30s
       apiVersion: helm.toolkit.fluxcd.io/v2
       kind: HelmRelease
       name: kubernetes-oidc-byo
   - describe:
+      timeout: 30s
       apiVersion: controlplane.cluster.x-k8s.io/v1alpha1
       kind: KamajiControlPlane
       name: kubernetes-oidc-byo
+  # Why these two podLogs selectors: see the kubernetes-oidc-system suite's catch
+  # block, which derives it once. The short version is that the Pods explaining a
+  # failed Ready wait carry two unrelated label sets -- the chart's own instance
+  # label and Kamaji's label for the tenant control plane -- and no single
+  # selector spans them. Kept as a pointer rather than a second copy, because a
+  # correction would otherwise have to be made twice and the second copy is the
+  # one that gets missed.
+  - podLogs:
+      selector: app.kubernetes.io/instance=kubernetes-oidc-byo
+      tail: 50
+      timeout: 30s
+  - podLogs:
+      selector: kamaji.clastix.io/name=kubernetes-oidc-byo
+      tail: 50
+      timeout: 30s
+  # Paired with the census for the reason the kubernetes-oidc-system suite gives:
+  # a podLogs collector cannot report that its selector matched nothing, so an
+  # empty capture and a stale selector look identical, and neither selector above
+  # is pinned by an assert here. That header also states what the census does NOT
+  # close -- it is a label check for the instance selector and a presence check
+  # for the Kamaji one.
+  - script:
+      timeout: 2m
+      content: |
+        set -eu
+        cd ../../..
+        . hack/e2e-chainsaw/_lib/pod-label-census.sh
+        pod_label_census "$NAMESPACE"
   steps:
   - name: create-kubernetes-oidc-byo
     try:
@@ -53,6 +84,10 @@ spec:
   - name: kamajicontrolplane-still-carries-authentication-config
     try:
     - assert:
+        # Bounded for the same reason as the catch ops here: inheriting
+        # timeouts.assert is not the same as being free, and this reads an object
+        # the previous step created, so one poll suffices on a healthy run.
+        timeout: 1m
         resource:
           apiVersion: controlplane.cluster.x-k8s.io/v1alpha1
           kind: KamajiControlPlane
@@ -72,6 +107,10 @@ spec:
           metadata:
             name: kubernetes-oidc-byo-oidc-authn-config
     - script:
+        # Bounded like every other op in these suites: no `timeout:` means
+        # timeouts.exec, which is 5m of budget for a jq read of a Secret the
+        # assert above just proved present.
+        timeout: 30s
         content: |
           set -eu
           body=$(kubectl -n "$NAMESPACE" get secret kubernetes-oidc-byo-oidc-authn-config \
@@ -90,7 +129,7 @@ spec:
   # Absence proofs — ordered after the positive asserts above (chart has
   # rendered), so `error` op polling to its timeout is a real negative, not a
   # not-yet-reconciled false pass.
-  - name: no-keycloak-objects-and-no-prerendered-kubeconfig
+  - name: no-keycloak-objects-in-cozy-realm
     try:
     - error:
         timeout: 30s
@@ -106,8 +145,73 @@ spec:
           kind: KeycloakClientScope
           metadata:
             name: tenant-test-kubernetes-oidc-byo-audience
-    # System mode pre-renders <release>-oidc-kubeconfig as a placeholder;
-    # CustomConfig must not.
+    # The third absence proof — no pre-rendered <release>-oidc-kubeconfig — is
+    # NOT here. Unlike the two above, which are pure chart-render facts, that
+    # Secret has a second possible author: the oidc-bootstrap Job writes it in
+    # System mode. Asserting its absence before that Job has run proves only that
+    # the Job had not got to it yet, so it moved to the last step, behind the
+    # assert that the Job has finished.
+
+  # Last step on purpose, and sized, for the reasons given in the
+  # kubernetes-oidc-system suite's own last step, which is where that mechanism
+  # is written out. This wait is 20m, the same as that suite carries, and the
+  # sameness is the point: both bounds are properties of the chart, not of the
+  # suite reading them. The floor is <release>-oidc-bootstrap's own 600s deadline
+  # for the admin kubeconfig, and that hook is the same hook here. The ceiling is
+  # release.cozystack.io/helm-install-timeout on the ApplicationDefinition, which
+  # is the same annotation for every release of this kind. The interval
+  # (10m, 20m] does not depend on which suite reads it, so two different numbers
+  # would need two different derivations and there is only one.
+  #
+  # A budget below that floor would red an install whose kubeconfig lands inside
+  # the hook's own window, which is the defect this change exists to remove
+  # rather than a cheaper version of it.
+  #
+  # The cost is real, and the wait is the largest single term in it: a failing run
+  # of this suite spends 20m of assert against 19m for ../.chainsaw.yaml's two
+  # global error.catch legs combined (6m and 13m). Those legs are the cheaper
+  # thing to reduce even so, because every failing suite pays them and they are
+  # repo-wide, which is #3754 -- but they do not outweigh this wait. The
+  # per-suite catch ops here all carry explicit budgets, so this suite's own
+  # contribution is a stated number rather than an inherited one.
+  #
+  # The Job assert that follows needs no LARGE budget of its own, because a
+  # release cannot be Ready until it has succeeded -- by the time that assert
+  # starts, the Job is in its final state and the assert is a read. It still
+  # carries one: 1m below, and it must. The guard added with this change rejects
+  # an absent or zero Job budget outright, because an unreadable duration reads
+  # back as a sentinel that both numeric comparisons then pass.
+  #
+  # In CustomConfig mode the oidc-bootstrap Job still writes the tenant
+  # ClusterRoleBindings for `users[]` and skips only the System-mode kubeconfig
+  # Secret patch, so asserting it here checks the payload this suite otherwise
+  # left unchecked — and it is what gives the absence proof below its meaning:
+  # after this, the one actor that would have created that Secret has run to
+  # completion and did not.
+  - name: helmrelease-ready-before-teardown
+    try:
+    - assert:
+        timeout: 20m
+        resource:
+          apiVersion: helm.toolkit.fluxcd.io/v2
+          kind: HelmRelease
+          metadata:
+            name: kubernetes-oidc-byo
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - assert:
+        timeout: 1m
+        resource:
+          apiVersion: batch/v1
+          kind: Job
+          metadata:
+            name: kubernetes-oidc-byo-oidc-bootstrap
+          status:
+            succeeded: 1
+    # System mode pre-renders <release>-oidc-kubeconfig and the bootstrap Job
+    # then fills it in; CustomConfig must do neither. Both of those actors are
+    # now finished, so this negative is a decided one.
     - error:
         timeout: 30s
         resource:

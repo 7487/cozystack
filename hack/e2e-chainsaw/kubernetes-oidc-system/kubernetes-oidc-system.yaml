@@ -1,13 +1,17 @@
-# No KubernetesNodes pool is created — this is a render-side test that only
-# asserts on the KamajiControlPlane + the cozy-realm Keycloak objects. Since the
-# Phase 2 split the kubernetes chart renders the control plane only (worker
-# pools are separate KubernetesNodes resources), so there are zero
+# No KubernetesNodes pool is created — this test asserts on the
+# KamajiControlPlane and the cozy-realm Keycloak objects, and needs no worker
+# node for either. It does need a serving tenant control plane, because its last
+# step waits for the release to finish installing; see the suite header.
+#
+# Since the Phase 2 split the kubernetes chart renders the control plane only
+# (worker pools are separate KubernetesNodes resources), so there are zero
 # MachineDeployments, KubevirtMachines or worker DataVolumes — no DRBD churn
-# overlapping the kubernetes-previous suite.
+# overlapping the kubernetes-previous suite (see #3231).
+#
 # Unlike the bats original, no talos.imageFactoryURL block is injected here:
 # the helper emits it only when the in-sandbox Talos image cache is up, and
-# with zero worker replicas this render-side test instantiates no DataVolume
-# imports for it to redirect — the static fixture stays equivalent.
+# with zero worker replicas this fixture instantiates no DataVolume imports for
+# it to redirect — the static fixture stays equivalent.
 apiVersion: apps.cozystack.io/v1alpha1
 kind: Kubernetes
 metadata:
