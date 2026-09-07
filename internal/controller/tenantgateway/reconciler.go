@@ -27,6 +27,7 @@ package tenantgateway
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
 
 	cmv1 "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
@@ -39,11 +40,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 
 	gatewayv1alpha1 "github.com/cozystack/cozystack/api/gateway/v1alpha1"
 )
@@ -92,6 +95,21 @@ func rendersTLSPassthrough(tgw *gatewayv1alpha1.TenantGateway) bool {
 	return tgw.Spec.CertMode != gatewayv1alpha1.CertModeEdge
 }
 
+// renderedPassthroughServices returns the tlsPassthroughServices
+// entries this mode actually turns into tls-<svc> listeners, which is
+// none under edge: TLS ends at the class provider, so the Gateway is
+// HTTP-only and carries no passthrough listener to name.
+//
+// Read by the renderer and by the cross-field checks alike, so a check
+// cannot refuse a spec over a listener the renderer was never going to
+// emit, and say the entry renders one twice while saying so.
+func renderedPassthroughServices(tgw *gatewayv1alpha1.TenantGateway) []string {
+	if !rendersTLSPassthrough(tgw) {
+		return nil
+	}
+	return tgw.Spec.TLSPassthroughServices
+}
+
 // gatewayIssuerName returns the per-tenant ACME Issuer name. The
 // Issuer lives in the same namespace as the TenantGateway and is
 // referenced by every Certificate this controller renders.
@@ -109,6 +127,8 @@ const (
 // +kubebuilder:rbac:groups=gateway.cozystack.io,resources=tenantgateways/finalizers,verbs=update
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways;httproutes;tlsroutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways/status;httproutes/status;tlsroutes/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=referencegrants,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 // +kubebuilder:rbac:groups=cert-manager.io,resources=certificates;issuers,verbs=get;list;watch;create;update;patch;delete
 
 // Reconciler reconciles TenantGateway resources, owning the downstream
@@ -147,14 +167,425 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 // out from Reconcile keeps the error-handling/status-update wrapper
 // in one place.
 func (r *Reconciler) runReconcileSteps(ctx context.Context, tgw *gatewayv1alpha1.TenantGateway) error {
+	// Judged before anything reads the passthrough lists. The
+	// enumeration below keys listeners by hostname, so two entries
+	// answering one name would have one of them silently dropped by a
+	// spec that is rejected only afterwards. Nothing observable depends
+	// on that ordering today, because the render fails before any route
+	// status is written; the point is that it should not have to.
+	//
+	// The controller keeps its own copy of these rules because it and
+	// the CRD roll out separately, so it cannot assume CEL was applied
+	// to what it reads.
+	if err := validatePassthroughListenerCertMode(tgw.Spec.TLSPassthroughListeners, tgw.Spec.CertMode); err != nil {
+		return err
+	}
+	if err := validateTLSPassthroughListeners(tgw.Spec.TLSPassthroughListeners, renderedPassthroughServices(tgw), tgw.Spec.Apex); err != nil {
+		return err
+	}
+
 	claims, err := r.collectHostnameClaims(ctx, tgw)
 	if err != nil {
 		return fmt.Errorf("collect attached hostnames: %w", err)
 	}
-	winners, losers := resolveHostnameOwners(claims)
+	losers := resolveHostnameOwners(claims)
 
-	dynHostnames := make([]string, 0, len(winners))
-	for h := range winners {
+	// A hostname earns an HTTPS-terminate listener and a Gateway-issued
+	// certificate when an HTTPRoute claims it and no passthrough
+	// listener answers it. Both forms of passthrough count, the
+	// port-443 tlsPassthroughServices entry and the native-port
+	// tlsPassthroughListeners one: the pinned Cilium selects a
+	// passthrough filter chain by SNI without the port, so a native
+	// port is not the separation it looks like. Both halves of the
+	// rule matter, and neither is the hostname's conflict winner:
+	//
+	// A TLSRoute attaches to a passthrough listener, where the backend
+	// presents its own certificate and the Gateway terminates nothing.
+	// Terminating its hostname ordered a certificate nobody serves.
+	//
+	// The passthrough listeners render from the spec alone, so the
+	// collision does not need a TLSRoute to appear — an HTTPRoute
+	// claiming <svc>.<apex> for a tlsPassthroughServices entry produces
+	// the same pair. Deciding on the claiming route's kind would leave
+	// that half open.
+	//
+	// Asking whether any claimant is an HTTPRoute, rather than whether
+	// the winner is one, keeps a TLSRoute from starving an HTTPRoute of
+	// its listener: resolveHostnameOwners ranks by namespace and name
+	// with no notion of kind, and records same-namespace losers nowhere,
+	// so a TLSRoute that merely sorted first would take the hostname
+	// while the HTTPRoute still reported Accepted=True.
+	//
+	// Ownership still decides who is Accepted between routes: claims and
+	// allRefs carry TLSRoutes untouched, so conflict resolution is
+	// unaffected. Their RouteParentStatus is not untouched, though — a
+	// TLSRoute is told below when no route of any kind can be served on
+	// its hostname. An HTTPRoute claiming the same name puts a terminate
+	// listener there, which the TLSRoute still cannot attach to, and
+	// that gap predates this change.
+	//
+	// Two views of the listeners the spec renders, taken from one
+	// enumeration so a passthrough source added later reaches both or
+	// neither. Native-port listeners admit only the tenant's own
+	// namespace, while claims are collected from every attached
+	// namespace, so a route elsewhere can claim a name it could never
+	// attach to. The port-443 entries do not have this gap: their
+	// allowedRoutes select on the gateway label, which every attached
+	// namespace carries. byHostname is keyed by rendered hostname,
+	// sections by rendered listener name, because a route pins itself to
+	// a listener by name while a claim overlaps hostnames. Both are
+	// needed to answer whether one route can be served on one hostname.
+	// byHostname doubles as the reserved-hostname set: its keys are
+	// exactly the hostnames a passthrough listener answers.
+	rendered := passthroughListeners(tgw)
+	byHostname := make(map[string]passthroughListener, len(rendered))
+	sections := make(map[string]string, len(rendered))
+	for _, l := range rendered {
+		byHostname[l.hostname] = l
+		sections[l.section] = l.hostname
+	}
+	dynHostnames := make([]string, 0, len(claims))
+	withdrawn := map[routeRef][]withdrawnHostname{}
+	for h, refs := range claims {
+		// A TLS-passthrough listener terminates nothing: it forwards
+		// the stream it matched by SNI, so an HTTPRoute pinning one by
+		// sectionName selects a listener that cannot serve it, whatever
+		// answers its hostname, and the terminate listener rendered for
+		// the same hostname carries a content-addressed name of its
+		// own. Gateway API derives the kinds a TLS listener takes from
+		// the protocol and that is TLSRoute alone. The port-443
+		// passthrough listeners name HTTPRoute in allowedRoutes.kinds
+		// all the same, to keep every port-443 set uniform
+		// (cilium#45559), and the Gateway reports that entry back on the
+		// listener as ResolvedRefs=False/InvalidRouteKinds rather than
+		// as a grant.
+		//
+		// Nothing else tells the route. CheckGatewayRouteKindAllowed
+		// (operator/pkg/gateway-api/routechecks/gateway_checks.go,
+		// v1.19.5) reads each listener's kinds against every route on
+		// the Gateway rather than against the routes that named it, so
+		// that same HTTPRoute entry has Cilium report this route
+		// Accepted, and this condition is the only refusal.
+		//
+		// Such a ref then leaves the hostname before anything else is
+		// decided about it, the way a refused TLSRoute leaves the
+		// eligibility race below: ownership ranks by namespace with no
+		// notion of who can attach, so a ref this pass refused could
+		// otherwise sort first and the route that can be served is told
+		// it lost to it. A hostname whose every claimant is refused
+		// earns no terminate listener and no certificate either, which
+		// is what collectHostnameClaims filters attachable routes for.
+		// The route itself keeps whatever the race recorded, for the
+		// reason withdrawnNoSuchSection keeps it: the listener this ref
+		// named says nothing about who holds the name.
+		refusedKind := map[routeRef]struct{}{}
+		claimants := refs[:0:0]
+		for _, ref := range refs {
+			refusable := ref.kind == routeKindHTTP && ref.parentRef.SectionName != nil
+			if !refusable {
+				claimants = append(claimants, ref)
+				continue
+			}
+			section := string(*ref.parentRef.SectionName)
+			if _, rendersIt := sections[section]; !rendersIt {
+				claimants = append(claimants, ref)
+				continue
+			}
+			refusedKind[ref] = struct{}{}
+			withdrawn[ref] = append(withdrawn[ref], withdrawnHostname{hostname: h, section: section, cause: withdrawnKindNotAdmitted})
+		}
+		// resolveHostnameOwners ranked every claimant, these included,
+		// so recount without them: the branches below each recount over
+		// the field they serve, and the hostname nothing answers reaches
+		// none of them. Run only where a ref was refused, so an ordinary
+		// race is decided once.
+		if len(refusedKind) > 0 && len(claimants) > 0 {
+			contenders := append(claimants[:0:0], claimants...)
+			rankRouteRefs(contenders)
+			for _, ref := range contenders {
+				if ref.namespace == contenders[0].namespace {
+					dropLostHostname(losers, ref, h)
+				}
+			}
+		}
+		// Matched by SNI overlap rather than by string equality,
+		// because the pinned Cilium answers a passthrough listener by
+		// SNI without the port. A "*.db.<apex>" entry therefore holds
+		// every published name beneath it, and leaving those names a
+		// terminate listener would put both chains on one SNI in the
+		// one Envoy listener the Gateway becomes. Declaring the
+		// wildcard is what asks for that: it says everything under
+		// that suffix bypasses termination.
+		//
+		// Several entries can match one claim. Reserved hostnames are
+		// pairwise non-overlapping, so a concrete claim matches at most
+		// one, but a claimed hostname is not always concrete: a route
+		// publishing "*.<apex>" covers every tlsPassthroughServices
+		// entry at once, and the shipped default carries three. For the
+		// message it does not matter which match is named, only that
+		// the same one is named every pass: a name that changes between
+		// passes is a status write that requeues this object through
+		// the route watch. Lexicographic order is the cheapest total
+		// order to hand, and carries no claim that the name it picks is
+		// the most specific one.
+		//
+		// Which name is kept is a stability choice and must not decide
+		// anything else. A concrete claim overlaps exactly one reserved
+		// entry, but a wildcard claim overlaps several, and the two
+		// kinds differ in who may attach: a port-443 entry takes routes
+		// from every attached namespace, a native-port one only from
+		// the tenant. So eligibility is read off the whole overlap set
+		// below, not off the name picked here.
+		var answeredBy string
+		for rh := range byHostname {
+			if !hostnamesOverlap(rh, h) {
+				continue
+			}
+			if answeredBy == "" || rh < answeredBy {
+				answeredBy = rh
+			}
+		}
+		if answeredBy != "" {
+			// Whether the passthrough listener takes the hostname over
+			// is decided by the routes on it, not by the spec that
+			// declared it. On the pinned Cilium,
+			// tlsPassthroughFilterChains
+			// (operator/pkg/model/translation/envoy_listener.go, v1.19.5)
+			// walks listener.Routes and skips a route with no backends,
+			// so a listener no TLSRoute attaches to emits no filter
+			// chain and matches no ClientHello, while the terminate
+			// listener's chain is built by httpsFilterChains from its
+			// own Secret and carries the name on its own. Withdrawing
+			// on the strength of the spec alone hands a hostname that
+			// is being served to a listener that forwards nowhere.
+			//
+			// Deferring is safe because the controller watches routes:
+			// the TLSRoute appearing requeues this object and the
+			// withdrawal lands on that pass, which leaves one reconcile
+			// where both chains carry the SNI. That window is the price
+			// of not shedding a live endpoint for a listener that may
+			// never carry one.
+			//
+			// Eligibility is stricter than "a TLSRoute claims this
+			// name": one pinned to another listener, refused for its
+			// namespace, or naming a port the listener does not publish
+			// attaches to nothing, so it puts no chain on the hostname
+			// either. Nor does one that attaches and then forwards
+			// nowhere, because the chain is built per route out of the
+			// backends that survived resolution, so a route whose
+			// backendRefs resolve to no Service is the routeless case
+			// with an object standing in it.
+			var tls []routeRef
+			for _, ref := range claimants {
+				if ref.kind != routeKindHTTP {
+					tls = append(tls, ref)
+				}
+			}
+			// A TLSRoute claiming a wildcard is not served on the
+			// wildcard. ComputeHosts returns the listener's own hostname
+			// for a route hostname covering it, so the chain carries this
+			// name while the claim sits under the broader key, and
+			// reading only the refs filed here would leave the terminate
+			// listener beside that chain.
+			//
+			// Pulled in for the eligibility question alone: the claim
+			// stays under the key its owner wrote, so the hostname it
+			// carries into the race and into any refusal is the one this
+			// pass is judging, and the route keeps a single entry per
+			// name rather than one per name it covers.
+			for k, krefs := range claims {
+				if k == h || !hostnameCovers(k, h) {
+					continue
+				}
+				for _, ref := range krefs {
+					if ref.kind != routeKindHTTP {
+						tls = append(tls, ref)
+					}
+				}
+			}
+			// The refused routes leave before a winner is picked, not
+			// while it is being applied: ownership ranks by namespace
+			// with no notion of eligibility, so a route this pass just
+			// refused can sort first and the one route that can attach
+			// is then told it lost to it.
+			eligible := tls[:0:0]
+			for _, ref := range tls {
+				servable, cause, refusedBy := servableOn(ref, h, tgw.Namespace, byHostname, sections)
+				if servable {
+					if ref.forwards {
+						eligible = append(eligible, ref)
+						continue
+					}
+					// Attached and forwarding nowhere, so out of the
+					// race like any other route that cannot carry the
+					// name, and with no withdrawal cause of its own.
+					// Gateway API puts an unresolvable backendRef under
+					// ResolvedRefs rather than under Accepted, and this
+					// route did attach to the listener it named, so a
+					// refusal invented here would contradict the object
+					// it sits on. Cilium writes that ResolvedRefs on
+					// its own RouteParentStatus for the same route.
+					//
+					// A loss the race already recorded stays, for the
+					// reason it stays on a route refused with no cause:
+					// the route did claim a hostname another route
+					// holds, which is true however its backends
+					// resolve, and dropping it would leave it in
+					// neither map and falling through to Accepted=True.
+					continue
+				}
+				// answeredBy is the name this pass reports for the
+				// hostname as a whole; a refusal has to name the
+				// listener that actually turned this route away, which
+				// on a claim overlapping several reserved names is a
+				// different one.
+				if cause == withdrawnNone {
+					// Out of the race, but with no cause to write: this
+					// route is unserved for a reason the withdrawal
+					// machinery does not model, and inventing one here
+					// would send its owner to the wrong field. Any loss
+					// the race already recorded stays: the route did
+					// claim a hostname another route holds, which is
+					// true whatever its sectionName says, and dropping
+					// it here would leave the route in neither map and
+					// falling through to Accepted=True.
+					continue
+				}
+				w := withdrawnHostname{hostname: h, answeredBy: answeredBy, cause: cause}
+				switch cause {
+				case withdrawnNoSuchSection:
+					// answeredBy is cleared rather than left naming the
+					// listener that holds the hostname: the field says
+					// what the named section answers, and a section
+					// that does not exist answers nothing.
+					w.section = string(*ref.parentRef.SectionName)
+					w.answeredBy = ""
+				case withdrawnSectionMismatch:
+					w.section = string(*ref.parentRef.SectionName)
+					w.answeredBy = sections[w.section]
+				case withdrawnPortMismatch:
+					w.port = int32(*ref.parentRef.Port)
+				case withdrawnForeignNamespace:
+					w.answeredBy = refusedBy
+				}
+				withdrawn[ref] = append(withdrawn[ref], w)
+				// The hostname leaves this route's race with every
+				// cause but one. A section that names no listener says
+				// nothing about who holds the name: the listener the
+				// route asked for does not exist, so it took nothing
+				// from anyone, and the loss to whoever did claim it is
+				// as true as before. The other causes each describe a
+				// listener that answers the name, which is what makes
+				// the race beside the point there.
+				if cause != withdrawnNoSuchSection {
+					dropLostHostname(losers, ref, h)
+				}
+			}
+			if len(eligible) == 0 {
+				// Nothing can attach to the passthrough listener, so it
+				// holds no SNI and only the terminate listener can
+				// answer. An HTTPRoute claiming the name keeps its
+				// listener and its certificate, exactly as it would
+				// with no passthrough listener declared at all.
+				var https []routeRef
+				for _, ref := range claimants {
+					if ref.kind == routeKindHTTP {
+						https = append(https, ref)
+					}
+				}
+				if len(https) == 0 {
+					continue
+				}
+				dynHostnames = append(dynHostnames, h)
+				// Recounted for the reason the served branch recounts:
+				// ownership ranked a field that included the TLSRoutes
+				// refused above, so the route now holding the listener
+				// can be carrying a loss to one of them. Same rule as
+				// there — the winner's namespace keeps the name, and a
+				// genuine loss to another HTTPRoute stays recorded.
+				rankRouteRefs(https)
+				winner := https[0]
+				for _, ref := range https {
+					if ref.namespace == winner.namespace {
+						dropLostHostname(losers, ref, h)
+					}
+				}
+				continue
+			}
+			// A TLSRoute on this hostname is the passthrough listener's
+			// intended user, so nothing is withdrawn from it and its
+			// status is left to conflict resolution. Only the HTTPRoute
+			// that expected termination lost something here.
+			//
+			// For that HTTPRoute the hostname also leaves the ownership
+			// race: losing it to another route is true and beside the
+			// point once nothing terminates it, and leaving the entry
+			// in would name one hostname under both causes in a single
+			// condition, sending the loser to look at a route that is
+			// not served either.
+			//
+			// A race between two TLSRoutes on this hostname is not moot
+			// the same way: the listener does exist, exactly one of
+			// them is served through it, and the other has to hear
+			// that from somewhere. Which of them lost is recounted
+			// below, because the record left here was decided against
+			// a field of claimants that included the HTTPRoutes just
+			// withdrawn.
+			for _, ref := range claimants {
+				if ref.kind != routeKindHTTP {
+					continue
+				}
+				withdrawn[ref] = append(withdrawn[ref], withdrawnHostname{hostname: h, answeredBy: answeredBy, cause: withdrawnAnswered})
+				dropLostHostname(losers, ref, h)
+			}
+			// The race was decided with no notion of kind, so its
+			// winner may be one of the HTTPRoutes just withdrawn, and
+			// a TLSRoute would then hold a conflict naming a route
+			// this same pass declined to serve. Recount over the
+			// TLSRoutes, the only routes a passthrough listener can
+			// serve, and clear what the mixed count produced.
+			rankRouteRefs(eligible)
+			tlsWinner := eligible[0]
+			for _, ref := range eligible {
+				if ref.namespace == tlsWinner.namespace {
+					dropLostHostname(losers, ref, h)
+				}
+			}
+			continue
+		}
+		if !slices.ContainsFunc(claimants, func(ref routeRef) bool { return ref.kind == routeKindHTTP }) {
+			// Claimed only by TLSRoutes, and no passthrough listener
+			// answers it. No terminate listener is rendered, and a
+			// TLSRoute could not attach to one anyway, so nothing on
+			// the Gateway serves this name and nothing on the Gateway
+			// says so either. An empty answeredBy marks that shape.
+			for _, ref := range claimants {
+				w := withdrawnHostname{hostname: h, cause: withdrawnUnanswered}
+				// A route that named a listener gets told about that
+				// listener instead. Nothing answers the hostname either
+				// way, but "this Gateway declares no passthrough
+				// listener" is false to a reader who named one that is
+				// rendered, and it hides the half they can fix.
+				if ref.parentRef.SectionName != nil {
+					if answers, exists := sections[string(*ref.parentRef.SectionName)]; exists {
+						w.cause = withdrawnSectionMismatch
+						w.section = string(*ref.parentRef.SectionName)
+						w.answeredBy = answers
+					}
+				}
+				withdrawn[ref] = append(withdrawn[ref], w)
+				// Dropped for every claimant here, where the branch
+				// above keeps it for a TLSRoute that lost to another
+				// TLSRoute. The difference is whether anything is on
+				// the other side of the race: there a passthrough
+				// listener exists and carries exactly one of them, so
+				// losing means something; here nothing answers the
+				// name and every claimant is unserved for the one
+				// reason worth printing.
+				dropLostHostname(losers, ref, h)
+			}
+			continue
+		}
 		dynHostnames = append(dynHostnames, h)
 	}
 	sort.Strings(dynHostnames)
@@ -193,7 +624,7 @@ func (r *Reconciler) runReconcileSteps(ctx context.Context, tgw *gatewayv1alpha1
 	if err := r.reconcilePerListenerCertificates(ctx, tgw, dynHostnames); err != nil {
 		return err
 	}
-	if err := r.updateRouteStatuses(ctx, tgw, allRefs, losers); err != nil {
+	if err := r.updateRouteStatuses(ctx, tgw, allRefs, losers, withdrawn); err != nil {
 		return err
 	}
 	if err := r.reconcileTLSRouteWithdrawal(ctx, tgw); err != nil {
@@ -202,7 +633,7 @@ func (r *Reconciler) runReconcileSteps(ctx context.Context, tgw *gatewayv1alpha1
 	if err := r.reconcileHTTPToHTTPSRedirect(ctx, tgw); err != nil {
 		return err
 	}
-	return r.reconcileStatus(ctx, tgw, dynHostnames)
+	return r.reconcileStatus(ctx, tgw)
 }
 
 // markFailed writes a Ready=False condition with Reason=ReconcileError
@@ -418,6 +849,21 @@ func (r *Reconciler) collectHostnameClaims(ctx context.Context, tgw *gatewayv1al
 	// above: this controller renders no TLSRoute, so there is nothing of
 	// its own to exclude. Add the equivalent guard here alongside the
 	// first controller-rendered TLSRoute, should one ever appear.
+	//
+	// The rendered passthrough listeners are what a route declaring no
+	// hostnames is served on, so they decide its claims. Same
+	// enumeration the withdrawal reads, for the reason it is one
+	// function: a passthrough source added later has to reach both.
+	rendered := passthroughListeners(tgw)
+	// Whether a TLSRoute forwards anywhere is read from the same objects
+	// Cilium reads it from, so the grants have to be to hand before the
+	// first route is judged. The CRD ships in the bundle that carries
+	// TLSRoute itself, which the list above already depends on, so this
+	// adds no install-time dependency of its own.
+	grants := &gatewayv1beta1.ReferenceGrantList{}
+	if err := r.List(ctx, grants); err != nil {
+		return nil, fmt.Errorf("list ReferenceGrants: %w", err)
+	}
 	for i := range tlsRoutes.Items {
 		route := &tlsRoutes.Items[i]
 		if _, ok := allowed[route.Namespace]; !ok {
@@ -427,19 +873,75 @@ func (r *Reconciler) collectHostnameClaims(ctx context.Context, tgw *gatewayv1al
 		if len(matchingRefs) == 0 {
 			continue
 		}
+		// Resolved once per route rather than per parentRef: the answer
+		// is a property of the route's own rules, and every ref built
+		// below has to carry the same one for routeRef to key a map.
+		forwards, err := r.tlsRouteForwards(ctx, route, grants.Items)
+		if err != nil {
+			return nil, err
+		}
 		for _, matchingRef := range matchingRefs {
 			ref := routeRef{
 				kind:      routeKindTLS,
 				namespace: route.Namespace,
 				name:      route.Name,
 				parentRef: matchingRef,
+				forwards:  forwards,
 			}
-			for _, h := range route.Spec.Hostnames {
-				out[string(h)] = append(out[string(h)], ref)
+			for _, h := range tlsRouteClaims(route, matchingRef, rendered) {
+				out[h] = append(out[h], ref)
 			}
 		}
 	}
 	return out, nil
+}
+
+// tlsRouteClaims returns the hostnames route claims through ref.
+//
+// A route that declares spec.hostnames claims those. A route that
+// declares none claims the hostname of every rendered passthrough
+// listener ref selects, because that is the name the pinned Cilium
+// serves it on: ComputeHosts (operator/pkg/model/helpers.go, v1.19.5)
+// substitutes the listener's own hostname for a route with no
+// hostnames, toTLSRoutes carries that into the model route
+// (operator/pkg/model/ingestion/gateway.go) and the filter chain is
+// built from it once a backend resolves. Reading spec.hostnames alone
+// would leave such a route out of the withdrawal while its chain sits
+// beside a terminate chain on one SNI, which is the pair this rule
+// exists to break up. TLSRoute v1alpha2 sets no minItems on the field,
+// and a route that pins its listener by sectionName has no use for it.
+// The route-hostname policy requires hostnames of a route in a tenant
+// namespace, so the shape arrives from the attached system namespaces,
+// where this platform's own routes live, or from an administrator.
+//
+// Selection follows the same function: toTLSRoutes takes a route whose
+// sectionName is absent onto every TLS listener, and one that names a
+// listener onto that listener alone. A sectionName naming no rendered
+// passthrough listener therefore yields no claim, and the route hears
+// nothing from this controller: every refusal it writes is keyed to a
+// hostname, and neither the route nor the listener it asked for
+// supplies one.
+//
+// parentRef.port is not read here. It does not decide which hostname a
+// route is served on, only whether the route attaches at all, which
+// servableOn answers for a substituted hostname exactly as it does for
+// a declared one.
+func tlsRouteClaims(route *gatewayv1alpha2.TLSRoute, ref gatewayv1.ParentReference, rendered []passthroughListener) []string {
+	if len(route.Spec.Hostnames) > 0 {
+		out := make([]string, 0, len(route.Spec.Hostnames))
+		for _, h := range route.Spec.Hostnames {
+			out = append(out, string(h))
+		}
+		return out
+	}
+	var out []string
+	for _, l := range rendered {
+		if ref.SectionName != nil && string(*ref.SectionName) != l.section {
+			continue
+		}
+		out = append(out, l.hostname)
+	}
+	return out
 }
 
 // pickAttachingParentRef returns the first ParentRef in refs that
@@ -825,19 +1327,43 @@ func (r *Reconciler) reconcileWildcardCertificate(ctx context.Context, tgw *gate
 // given TenantGateway. The result is owned by the TenantGateway via
 // controllerutil.SetControllerReference so cascade delete works.
 //
-// dynHostnames is the deduplicated list of hostnames pulled from
-// HTTPRoutes / TLSRoutes attached to this Gateway. In HTTP-01 mode
-// each becomes an HTTPS listener with its own per-listener cert. In
-// DNS-01 mode dynHostnames is expected to be empty (collector returns
-// nothing) — the wildcard listener handles all subdomains.
+// dynHostnames is the deduplicated list of hostnames owned by an
+// HTTPRoute attached to this Gateway. In HTTP-01 mode each becomes an
+// HTTPS listener with its own per-listener cert. In DNS-01 mode
+// dynHostnames is expected to be empty (collector returns nothing) —
+// the wildcard listener handles all subdomains. Hostnames owned by a
+// TLSRoute are excluded upstream in runReconcileSteps: they belong to a
+// passthrough listener, which terminates nothing and needs no cert.
 //
-// Every listener is gated by an unspoofable namespace selector
-// (kubernetes.io/metadata.name In [...]) so only the publishing
-// tenant namespace plus the TenantGateway.Spec.AttachedNamespaces
-// list (cozy-* platform namespaces) can attach routes. This is
+// Every listener is gated by a namespace selector, but not the same
+// one. The port-80 listener pins an unspoofable
+// kubernetes.io/metadata.name In [...] list naming the tenant
+// namespace and the ACME challenge namespace, and the native-port
+// listeners from tlsPassthroughListeners pin the same label naming the
+// tenant namespace alone. The HTTPS-terminate and port-443 passthrough
+// listeners select on namespace.cozystack.io/gateway, which the controller
+// stamps on the tenant namespace and on each
+// TenantGateway.Spec.AttachedNamespaces entry (cozy-* platform
+// namespaces), and which the tenant chart also stamps on every
+// inheriting child tenant namespace — so the attach set is the whole
+// inheriting subtree, not just the tenant plus the admin list. This is
 // Layer 1 of the security model documented in
 // packages/extra/gateway/README.md.
 func (r *Reconciler) renderGateway(tgw *gatewayv1alpha1.TenantGateway, dynHostnames []string, childApexes []string) (*gatewayv1.Gateway, error) {
+	// This function does not render from a spec it has not judged, which
+	// is a property of the function rather than of any one caller: the
+	// object it produces is refused wholesale by the apiserver when a
+	// single composed value is malformed, so returning a Gateway built
+	// from an unchecked spec has no safe reading. The reconcile path
+	// judges the same spec earlier, for a different reason given there.
+	// Cert mode first, because it refuses the field outright and a
+	// hostname or port error inside it then decides nothing.
+	if err := validatePassthroughListenerCertMode(tgw.Spec.TLSPassthroughListeners, tgw.Spec.CertMode); err != nil {
+		return nil, err
+	}
+	if err := validateTLSPassthroughListeners(tgw.Spec.TLSPassthroughListeners, renderedPassthroughServices(tgw), tgw.Spec.Apex); err != nil {
+		return nil, err
+	}
 	allowedRoutes := buildAllowedRoutes(tgw)
 	httpAllowedRoutes := buildHTTPListenerAllowedRoutes(tgw)
 	listeners := []gatewayv1.Listener{}
@@ -865,12 +1391,20 @@ func (r *Reconciler) renderGateway(tgw *gatewayv1alpha1.TenantGateway, dynHostna
 	// contents are a least-privilege choice: nothing the platform ships
 	// needs gRPC, TCP or UDP routing on port 443, so those three kinds
 	// stay out of the set.
-	port443Kinds := []gatewayv1.RouteGroupKind{
-		{Group: ptrGroup(gatewayv1.GroupName), Kind: "HTTPRoute"},
-		{Group: ptrGroup(gatewayv1.GroupName), Kind: "TLSRoute"},
+	//
+	// Built per listener rather than cloned from one value. A clone
+	// gives each listener its own slice header while the elements go on
+	// sharing one *Group each, so narrowing a single listener's kinds
+	// later would still reach across all of them — the same hazard the
+	// clone was added to remove, one level down.
+	port443Kinds := func() []gatewayv1.RouteGroupKind {
+		return []gatewayv1.RouteGroupKind{
+			{Group: ptrGroup(gatewayv1.GroupName), Kind: "HTTPRoute"},
+			{Group: ptrGroup(gatewayv1.GroupName), Kind: "TLSRoute"},
+		}
 	}
 	httpsAllowedRoutes := allowedRoutes.DeepCopy()
-	httpsAllowedRoutes.Kinds = port443Kinds
+	httpsAllowedRoutes.Kinds = port443Kinds()
 
 	switch tgw.Spec.CertMode {
 	case gatewayv1alpha1.CertModeEdge:
@@ -941,7 +1475,7 @@ func (r *Reconciler) renderGateway(tgw *gatewayv1alpha1.TenantGateway, dynHostna
 						{Name: gatewayv1.ObjectName(certName)},
 					},
 				},
-				AllowedRoutes: httpsAllowedRoutes,
+				AllowedRoutes: httpsAllowedRoutes.DeepCopy(),
 			},
 			gatewayv1.Listener{
 				Name:     "https-apex",
@@ -954,7 +1488,7 @@ func (r *Reconciler) renderGateway(tgw *gatewayv1alpha1.TenantGateway, dynHostna
 						{Name: gatewayv1.ObjectName(certName)},
 					},
 				},
-				AllowedRoutes: httpsAllowedRoutes,
+				AllowedRoutes: httpsAllowedRoutes.DeepCopy(),
 			},
 		)
 		// Per-child-apex wildcard listeners — every inheriting
@@ -1017,36 +1551,110 @@ func (r *Reconciler) renderGateway(tgw *gatewayv1alpha1.TenantGateway, dynHostna
 	// (cilium#45559). In practice only TLSRoute attaches to a Passthrough
 	// listener, but listing HTTPRoute here is harmless — Gateway API
 	// rejects any HTTPRoute that references a Passthrough sectionName.
-	// NOTE: on Cilium 1.19.x each tls-<svc> listener will surface
-	// ResolvedRefs=False/InvalidRouteKinds on the raw Gateway object
+	// NOTE: each tls-<svc> listener surfaces
+	// ResolvedRefs=False/InvalidRouteKinds on the raw Gateway object,
+	// because it lists a kind its own protocol does not support
 	// (cosmetic — Accepted, Programmed, traffic, and TenantGateway
-	// readiness are all unaffected); removable once Cilium 1.20 /
-	// cilium#45693 ships.
+	// readiness are all unaffected). That condition is set by
+	// setListenerStatus, a different path from the route-side check
+	// cilium#45693 fixes, and that fix lands in v1.19.6 rather than
+	// waiting for 1.20. So the bump does not clear this one: it goes
+	// when the uniform-kinds workaround on port 443 goes, which is a
+	// separate cleanup.
 	// The corresponding TLSRoute templates (cozystack-api, vm-exportproxy,
 	// cdi-uploadproxy) attach to these listeners by sectionName.
-	passthroughServices := tgw.Spec.TLSPassthroughServices
-	if !rendersTLSPassthrough(tgw) {
-		passthroughServices = nil
-	}
-	for _, svc := range passthroughServices {
+	for _, svc := range renderedPassthroughServices(tgw) {
 		host := gatewayv1.Hostname(svc + "." + tgw.Spec.Apex)
-		passthroughAllowed := *allowedRoutes
-		passthroughAllowed.Kinds = port443Kinds
+		passthroughAllowed := allowedRoutes.DeepCopy()
+		passthroughAllowed.Kinds = port443Kinds()
 		listeners = append(listeners, gatewayv1.Listener{
-			Name:     gatewayv1.SectionName("tls-" + svc),
+			Name:     gatewayv1.SectionName(passthroughListenerPrefix + svc),
 			Port:     443,
 			Protocol: gatewayv1.TLSProtocolType,
 			Hostname: &host,
 			TLS: &gatewayv1.ListenerTLSConfig{
 				Mode: ptrTLSMode(gatewayv1.TLSModePassthrough),
 			},
-			AllowedRoutes: &passthroughAllowed,
+			AllowedRoutes: passthroughAllowed,
+		})
+	}
+
+	// Layer-4 TLS-passthrough listeners. One
+	// "tls-<name>" listener per entry in Spec.TLSPassthroughListeners,
+	// on the entry's native Port, mode Passthrough, matching the
+	// entry's per-engine SNI Hostname, rendered alongside the port-443
+	// terminate listeners. What may attach is left to the protocol
+	// rather than declared: the port-443 TLSPassthroughServices
+	// listeners above must share their allowedRoutes.kinds with the
+	// terminate listeners to dodge Cilium's same-port listener collapse
+	// (cilium#45559), and these declare no kinds at all, because on the
+	// pinned Cilium a declared set is applied to every route on the
+	// Gateway rather than to the listener that declares it. A dedicated
+	// (port, SNI) pair still yields exactly one Envoy filter chain that
+	// SNI-routes to the attaching TLSRoute's backend. No engine is wired here: the
+	// TLSRoute, certificate, and CA plumbing land in later phases.
+	for _, pl := range tgw.Spec.TLSPassthroughListeners {
+		host := gatewayv1.Hostname(pl.Hostname)
+		// Own namespace only, by the label kube-apiserver writes, and
+		// not the gateway label the :443 listeners select on. That
+		// label is stamped on every inheriting child tenant namespace,
+		// so reusing it would put a native database port within reach
+		// of the whole subtree. Narrowing costs nothing while no chart
+		// value exposes this field; once something depends on the wide
+		// form, narrowing becomes a behaviour change instead.
+		// Kinds is left unset on purpose, and the reason is upstream
+		// rather than stylistic. CheckGatewayRouteKindAllowed at the
+		// pinned v1.19.5 walks every listener on the Gateway with no
+		// port and no sectionName filter, skips the ones that declare
+		// no kinds, and overwrites the route's Accepted condition on
+		// each of the rest, last one winning. A listener declaring
+		// TLSRoute alone would therefore reject every HTTPRoute on the
+		// Gateway, whatever port it sits on. Declaring nothing keeps
+		// this listener out of that loop. What it opens is bounded by
+		// the implementation rather than by the spec: Gateway API says
+		// only that an absent Kinds derives the set from the listener
+		// protocol and leaves the mapping to the implementation, and
+		// the conventional table pairs TLS with TCPRoute as well as
+		// TLSRoute. Cilium implements neither TCPRoute nor UDPRoute, so
+		// on the pinned version TLSRoute is what a TLS listener admits,
+		// and the listener pins kubernetes.io/metadata.name to the
+		// publishing tenant regardless.
+		//
+		// This one lifts on a patch bump rather than with the rest of
+		// the pin: v1.19.6 skips listeners the parentRef's sectionName
+		// or port does not name and returns on the first match, so
+		// declaring TLSRoute here would then bind to this listener
+		// alone. Spelling it out again is safe from that release on,
+		// and pointless, since the protocol already says TLSRoute.
+		passthroughAllowed := allowedRoutesFromValues([]string{tgw.Namespace})
+		listeners = append(listeners, gatewayv1.Listener{
+			Name:     gatewayv1.SectionName(passthroughListenerPrefix + pl.Name),
+			Port:     gatewayv1.PortNumber(pl.Port),
+			Protocol: gatewayv1.TLSProtocolType,
+			Hostname: &host,
+			TLS: &gatewayv1.ListenerTLSConfig{
+				Mode: ptrTLSMode(gatewayv1.TLSModePassthrough),
+			},
+			AllowedRoutes: passthroughAllowed,
 		})
 	}
 
 	className := tgw.Spec.GatewayClassName
 	if className == "" {
 		className = "cilium"
+	}
+
+	// Gateway API caps spec.listeners at 64 and rejects the object
+	// wholesale past that — every app's HTTPS listener included. No
+	// single field can prevent it, because the total is the sum of
+	// published hostnames, passthrough services and passthrough
+	// listeners, and each is bounded on its own. Catch the sum here so
+	// the tenant gets a named budget on TenantGateway status instead of
+	// an admission error on a Gateway they do not manage.
+	if len(listeners) > maxGatewayListeners {
+		return nil, fmt.Errorf(
+			"gateway would have %d listeners, over the Gateway API cap of %d: reduce published hostnames, tlsPassthroughServices, or tlsPassthroughListeners (dns01 cert mode collapses per-hostname listeners into one wildcard listener)",
+			len(listeners), maxGatewayListeners)
 	}
 
 	gw := &gatewayv1.Gateway{
@@ -1209,7 +1817,11 @@ func (r *Reconciler) stripNamespaceGatewayLabel(ctx context.Context, name string
 }
 
 // route additions in attached namespaces re-trigger reconciliation
-// of the parent TenantGateway.
+// of the parent TenantGateway, and so do the objects a TLSRoute's
+// backendRef resolves through: a route that forwards nowhere leaves
+// the terminate listener standing, so the Service appearing — or the
+// ReferenceGrant that admits a cross-namespace reference — is what
+// lands the withdrawal that was deferred.
 func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("tenantgateway-controller").
@@ -1225,6 +1837,15 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(
 			&gatewayv1alpha2.TLSRoute{},
 			r.routeToTenantGateway(),
+		).
+		Watches(
+			&corev1.Service{},
+			r.backendToTenantGateways(),
+			builder.WithPredicates(serviceExistenceChanged()),
+		).
+		Watches(
+			&gatewayv1beta1.ReferenceGrant{},
+			r.backendToTenantGateways(),
 		).
 		Complete(r)
 }
