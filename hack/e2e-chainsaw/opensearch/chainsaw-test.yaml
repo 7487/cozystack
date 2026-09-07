@@ -1,0 +1,404 @@
+# The move onto chart-managed HTTP TLS, run on a cluster.
+#
+# packages/apps/opensearch/tests/tls_upgrade_test.yaml pins that one set of
+# values renders the CR, the cert-manager chain and the tenant sentinel
+# together. Three things it cannot observe decide whether the move survives
+# contact with a running cluster: whether the CR converges when `generate` is
+# dropped from it, whether the operator re-mints the admin certificate once the
+# CA subject changes, and whether the nodePool StatefulSet finishes rolling as
+# the mount plan moves from one whole-secret volume to three subPath mounts
+# (opensearch-k8s-operator v2.8.0, pkg/reconcilers/tls.go handleHttp: one
+# whole-folder volume while the operator generates, three mount() calls carrying
+# SubPath once caSecret is set).
+#
+# The starting state is `tls.enabled: false` rather than the previous chart
+# version, so the suite runs the move and not the chart bump. Removing the key
+# leaves exactly the values an upgraded release arrives with, and the resolution
+# of an absent key is settled by the render tests. The step that a chart bump
+# would add and this cannot is the one where the OLD chart wrote the CR; a suite
+# in this tree has no second chart version to install from.
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Test
+metadata:
+  name: opensearch
+spec:
+  catch:
+  - events: {}
+  - describe:
+      apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: opensearch-test
+  - describe:
+      apiVersion: opensearch.opster.io/v1
+      kind: OpenSearchCluster
+      name: opensearch-test
+  # cert-manager records a refusal to issue in the Certificate's conditions.
+  # Without this an unissued chain shows up only as an absent Secret, and the
+  # CR then names a Secret that is never going to appear.
+  - describe:
+      apiVersion: cert-manager.io/v1
+      kind: Certificate
+  # The controller writes its verdict into the sentinel's status conditions
+  # (SourceNotFound, SourceRejected, ProjectionCollision).
+  - describe:
+      apiVersion: internal.cozystack.io/v1alpha1
+      kind: TenantProjection
+  - podLogs:
+      selector: opster.io/opensearch-cluster=opensearch-test
+      tail: 100
+  # The external Service is a LoadBalancer, so an address pool with nothing left
+  # in it holds the HelmRelease short of Ready with nothing in the HelmRelease
+  # itself naming the cause.
+  - get:
+      apiVersion: v1
+      kind: Service
+      format: yaml
+  steps:
+  - name: create-opensearch
+    try:
+    - apply:
+        file: opensearch.yaml
+
+  - name: wait-helmrelease-ready
+    try:
+    - assert:
+        timeout: 6m
+        resource:
+          apiVersion: helm.toolkit.fluxcd.io/v2
+          kind: HelmRelease
+          metadata:
+            name: opensearch-test
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+
+  - name: verify-operator-managed-listener
+    try:
+    - assert:
+        timeout: 2m
+        resource:
+          apiVersion: opensearch.opster.io/v1
+          kind: OpenSearchCluster
+          metadata:
+            name: opensearch-test
+          spec:
+            security:
+              tls:
+                http:
+                  generate: true
+    # The starting state has to be the one being moved off, or the whole suite
+    # asserts a chain that was there from the start. A Certificate that does not
+    # exist will not start existing while chainsaw waits, so these are short.
+    - error:
+        timeout: 30s
+        resource:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: opensearch-test-http-ca
+    - error:
+        timeout: 30s
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-test.tenant-ca
+    # Longer than the 5-6m standard (e2e-testing.md reviewer checklist, item 6):
+    # this is a first boot, so it
+    # covers the OpenSearch image pull, the operator's bootstrap pod and the
+    # securityadmin job before the nodePool pod reports ready.
+    #
+    # The mount plan is the half that has to move, so it is pinned on both sides.
+    # Here the operator generated its own certificates and mounts the whole
+    # Secret it wrote them into (mountFolder, one volume). Projections rather
+    # than a volume list: the list is the operator's to order.
+    - assert:
+        timeout: 12m
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: opensearch-test-nodes
+          (spec.template.spec.volumes[?name == 'http-cert'].secret.secretName):
+          - opensearch-test-http-cert
+          (length(spec.template.spec.volumes[?name == 'http-ca'])): 0
+          status:
+            readyReplicas: 1
+
+  - name: move-onto-chart-managed-tls
+    try:
+    # A JSON-patch remove rather than an apply of a second fixture: what an
+    # upgrade delivers is the absence of the key, and an apply that merely
+    # omitted it would leave the old value in place.
+    - script:
+        timeout: 1m
+        content: |
+          set -eu
+          kubectl -n "$NAMESPACE" patch opensearches.apps.cozystack.io test \
+            --type=json --patch '[{"op": "remove", "path": "/spec/tls/enabled"}]'
+
+  - name: verify-certmanager-chain-issued
+    try:
+    - assert:
+        timeout: 3m
+        resource:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: opensearch-test-http-ca
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+    - assert:
+        timeout: 3m
+        resource:
+          apiVersion: cert-manager.io/v1
+          kind: Certificate
+          metadata:
+            name: opensearch-test-http-server
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+
+  # The first of the three things a render cannot reach: `generate` was written
+  # into a live CR by the previous reconcile and has to be gone from it, not
+  # merely absent from the new manifest.
+  - name: verify-cr-dropped-generate
+    try:
+    - assert:
+        timeout: 3m
+        resource:
+          apiVersion: opensearch.opster.io/v1
+          kind: OpenSearchCluster
+          metadata:
+            name: opensearch-test
+          (spec.security.tls.http.generate == null): true
+          spec:
+            security:
+              tls:
+                http:
+                  secret:
+                    name: opensearch-test-http-server
+                  caSecret:
+                    name: opensearch-test.http-ca
+
+  # The second: the operator decides whether to re-mint the admin certificate by
+  # comparing the DN bytes of its issuer against the CA subject
+  # (shouldCreateAdminCert -> IsSignedByCA). Once the CR names the chart's CA
+  # that comparison has to fail and the certificate has to be reissued under it,
+  # or securityadmin presents one signed by a CA the listener no longer trusts
+  # and the security configuration stops applying with a job timeout as the only
+  # sign. Nothing models this as a Kubernetes condition, so it is read out of the
+  # certificate itself.
+  - name: verify-admin-certificate-moved-to-the-chart-ca
+    try:
+    - script:
+        timeout: 5m
+        content: |
+          set -eu
+
+          # Both sides are printed with the same -nameopt, so they are
+          # comparable whatever the local openssl's default format is.
+          ca_subject=$(kubectl -n "$NAMESPACE" get secret opensearch-test.http-ca \
+            -o jsonpath='{.data.tls\.crt}' | base64 -d \
+            | openssl x509 -noout -subject -nameopt RFC2253)
+          ca_subject=${ca_subject#subject=}
+
+          # Polls rather than reads once: the re-mint and the StatefulSet update
+          # come out of the same reconcile and nothing orders them against each
+          # other, so a single read can land between the two.
+          deadline=$(( $(date +%s) + 240 ))
+          while :; do
+            issuer=$(kubectl -n "$NAMESPACE" get secret opensearch-test-admin-cert \
+              -o jsonpath='{.data.tls\.crt}' | base64 -d \
+              | openssl x509 -noout -issuer -nameopt RFC2253) || issuer=""
+            issuer=${issuer#issuer=}
+            if [ "$issuer" = "$ca_subject" ]; then
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "the admin certificate is still signed by the operator's own CA" >&2
+              echo "issuer:     $issuer" >&2
+              echo "chart CA:   $ca_subject" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+
+  # The third: the mount plan moves from one whole-secret volume to three
+  # subPath mounts, and the StatefulSet has to finish rolling onto it. Equal
+  # revisions plus a ready updated replica is the roll completing; the volume
+  # projections are what it rolled onto. Same 12m as the first boot, for the
+  # same reason — the replacement pod pulls and starts OpenSearch from scratch.
+  - name: verify-statefulset-rolled-onto-the-new-mount-plan
+    try:
+    - assert:
+        timeout: 12m
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: opensearch-test-nodes
+          (spec.template.spec.volumes[?name == 'http-cert'].secret.secretName):
+          - opensearch-test-http-server
+          (spec.template.spec.volumes[?name == 'http-key'].secret.secretName):
+          - opensearch-test-http-server
+          (spec.template.spec.volumes[?name == 'http-ca'].secret.secretName):
+          - opensearch-test.http-ca
+          status:
+            readyReplicas: 1
+            updatedReplicas: 1
+            (currentRevision == updateRevision): true
+
+  # The sentinel and the projection are Helm-owned and controller-written
+  # respectively, so this is the half of the move that has to appear rather than
+  # converge. tenantresource is the lineage webhook's verdict, computed from the
+  # ApplicationDefinition selector, and nothing short of a cluster proves it.
+  - name: verify-tenant-anchor-published
+    try:
+    - assert:
+        timeout: 3m
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: opensearch-test.tenant-ca
+            labels:
+              internal.cozystack.io/tenant-ca: "true"
+              internal.cozystack.io/tenantresource: "true"
+          type: Opaque
+    # Deterministic once the assert above passes, so no retry.
+    - script:
+        timeout: 2m
+        content: |
+          set -eu
+
+          # Exactly one key, and it is ca.crt. The source Secret holds the CA
+          # private key under tls.key, so a second key here is that key leaving
+          # the namespace.
+          keys=$(kubectl -n "$NAMESPACE" get secret opensearch-test.tenant-ca \
+            -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' | sort | tr '\n' ' ')
+          if [ "$keys" != "ca.crt " ]; then
+            echo "projection must hold exactly ca.crt, holds: $keys" >&2
+            exit 1
+          fi
+
+          # Asserting the source really does carry tls.key keeps the check above
+          # honest: if cert-manager ever stopped storing it there, the check
+          # would keep passing while proving nothing.
+          if ! kubectl -n "$NAMESPACE" get secret opensearch-test.http-ca \
+            -o go-template='{{if .data}}{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}{{end}}' | grep -qx 'tls.key'; then
+            echo "opensearch-test.http-ca no longer carries tls.key — this check has stopped proving anything" >&2
+            exit 1
+          fi
+
+          # The delivery path the README tells a tenant to use. Everything above
+          # reads the raw Secret, which only an admin can do.
+          anchor=$(kubectl -n "$NAMESPACE" get tenantsecret opensearch-test.tenant-ca \
+            -o jsonpath='{.data.ca\.crt}' | base64 -d)
+          if ! echo "$anchor" | grep -q 'BEGIN CERTIFICATE'; then
+            echo "the trust anchor is not served through core.cozystack.io/tenantsecrets" >&2
+            exit 1
+          fi
+
+          # And the negative that gives it meaning: the key-bearing Secrets must
+          # not be reachable the same way.
+          for s in opensearch-test.http-ca opensearch-test-http-server; do
+            if kubectl -n "$NAMESPACE" get tenantsecret "$s" >/dev/null 2>&1; then
+              echo "key-bearing $s is being served as a tenant secret" >&2
+              exit 1
+            fi
+          done
+
+  # The outcome the whole move is for, and the only check that reads what the
+  # pods are actually serving rather than what they were asked to serve. A roll
+  # that completed onto a stale mount passes every assert above and fails here.
+  - name: verify-endpoint-serves-the-chart-chain
+    try:
+    - script:
+        timeout: 4m
+        content: |
+          set -eu
+          workdir=$(mktemp -d)
+          trap '[ -n "${pf_pid:-}" ] && kill "$pf_pid" 2>/dev/null || true; rm -rf "$workdir"' EXIT
+
+          kubectl -n "$NAMESPACE" get secret opensearch-test.tenant-ca \
+            -o jsonpath='{.data.ca\.crt}' | base64 -d > "$workdir/ca.crt"
+          kubectl -n "$NAMESPACE" get secret opensearch-test-http-server \
+            -o jsonpath='{.data.tls\.crt}' | base64 -d > "$workdir/chart-leaf.crt"
+
+          # Through the chart's own external Service rather than the operator's:
+          # its selector is part of this change, so a selector that matches no
+          # pod fails here instead of silently serving nothing.
+          kubectl -n "$NAMESPACE" port-forward service/opensearch-test-external 9200:9200 >/dev/null 2>&1 &
+          pf_pid=$!
+          timeout 30 sh -ec 'until nc -z localhost 9200; do sleep 1; done'
+
+          # -verify_return_error turns a chain that does not build into a
+          # non-zero exit. The anchor is the one the tenant is handed, so this
+          # is the tenant's own verification, not an admin's.
+          if ! openssl s_client -connect 127.0.0.1:9200 -servername opensearch-test \
+            -CAfile "$workdir/ca.crt" -verify_return_error </dev/null \
+            >"$workdir/handshake.log" 2>&1; then
+            echo "the HTTP listener does not verify against the anchor published to the tenant" >&2
+            cat "$workdir/handshake.log" >&2
+            exit 1
+          fi
+
+          # Verifying against the CA says the chain is the chart's. This says
+          # the pods picked up the leaf cert-manager minted, which is the half
+          # the subPath mount plan puts at risk.
+          sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$workdir/handshake.log" > "$workdir/served.crt"
+          served_fp=$(openssl x509 -noout -fingerprint -sha256 -in "$workdir/served.crt")
+          chart_fp=$(openssl x509 -noout -fingerprint -sha256 -in "$workdir/chart-leaf.crt")
+          if [ "$served_fp" != "$chart_fp" ]; then
+            echo "the listener is not serving the certificate the chart minted" >&2
+            echo "served: $served_fp" >&2
+            echo "chart:  $chart_fp" >&2
+            exit 1
+          fi
+
+  # e2e-testing.md §6: the move is an upgrade of the parent HelmRelease, and the
+  # failure it is most likely to produce is Flux uninstalling the release and
+  # reinstalling it — which leaves the cluster Ready and every assert above
+  # green, having taken the tenant's search cluster down on the way.
+  - name: verify-helmrelease-did-not-remediate
+    try:
+    - script:
+        timeout: 2m
+        content: |
+          set -eu
+          cd ../../..
+          . hack/e2e-chainsaw/_lib/remediation-guard.sh
+          statuses=$(kubectl -n "$NAMESPACE" get helmrelease opensearch-test \
+            -o jsonpath='{range .status.history[*]}{.status}{"\n"}{end}')
+          if helmrelease_has_remediation_cycle "$statuses"; then
+            echo "the HelmRelease remediated across the move; history:" >&2
+            echo "$statuses" >&2
+            exit 1
+          fi
+
+  # The nodePool claim is templated by the StatefulSet, so deleting the app is
+  # not enough to reclaim it: Kubernetes never garbage-collects a
+  # StatefulSet-templated PVC (#3059), this chart ships no cleanup hook the way
+  # qdrant, mariadb and clickhouse do, and the operator's own DeleteResources is
+  # empty at v2.8.0. e2e-testing.md §4 puts that on the test, so it is pruned here
+  # rather than left holding replicated storage for whatever suite runs next.
+  # Chainsaw's cleanup still deletes the app it applied; a second delete of an
+  # object that is already gone is a no-op.
+  - name: delete-and-prune-the-templated-claim
+    try:
+    - delete:
+        ref:
+          apiVersion: apps.cozystack.io/v1alpha1
+          kind: OpenSearch
+          name: test
+    - script:
+        timeout: 5m
+        content: |
+          set -eu
+          # --ignore-not-found covers a run where the claim was never bound; a
+          # delete that hangs still fails the step on the timeout below, which
+          # is the stuck teardown convention 4 exists to surface.
+          kubectl -n "$NAMESPACE" delete pvc data-opensearch-test-nodes-0 \
+            --ignore-not-found --wait=true --timeout=4m
