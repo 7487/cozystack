@@ -111,9 +111,16 @@ COMPOSE_PROJECT="${COMPOSE_PROJECT:-cozy-e2e}"
 # A smaller pool is not safe even when its sparse backing file fits physically:
 # root-tenant local PVCs can leave a satellite with less than the ~21 GiB needed
 # by CDI scratch. Once a worker's 20 GiB target PV is bound there, node affinity
-# forces the importer and scratch volume onto that same full satellite. Match the
-# QEMU lane's per-node 200 GB /dev/vdc so placement cannot turn node join into a
-# storage-capacity lottery.
+# forces the importer and scratch volume onto that same full satellite, and
+# placement turns node join into a storage-capacity lottery.
+#
+# 200 GB is this lane's own figure and no longer the QEMU lane's, which is larger.
+# DRBD is what separates them: this lane runs drbd.enabled=false with
+# COZY_E2E_STORAGE_CLASS=local, so a worker disk is stored once, while the QEMU
+# lane's `replicated` class stores it per replica. The golden-image clone path
+# holds the clone source and the growing target at the same time, so the same
+# suites peak several times higher over there -- see the sizing note in
+# hack/e2e-prepare-cluster.bats. Size this lane against a single copy.
 ZPOOL_SIZE="${ZPOOL_SIZE:-200G}"
 ZPOOL_BACKING_DIR="${ZPOOL_BACKING_DIR:-/var/lib/cozy-e2e-zpools}"
 KUBERNETES_VERSION="${KUBERNETES_VERSION:-v1.33.12}"

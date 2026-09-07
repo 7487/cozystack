@@ -28,9 +28,9 @@ E2E_CONTAINER_UP_LIB=true . "$CONTAINER_UP"
   fi
 }
 
-@test "container storage pools match the QEMU lane capacity" {
+@test "container storage pools keep the per-node 200G this lane sizes against" {
   if ! grep -Fq 'ZPOOL_SIZE="${ZPOOL_SIZE:-200G}"' "$CONTAINER_UP"; then
-    echo "container ZFS pools do not provide the QEMU lane's 200G per node" >&2
+    echo "container ZFS pools do not provide the 200G per node this lane sizes against" >&2
     return 1
   fi
 }
