@@ -28,7 +28,7 @@ log_substep "Waiting for BackupJob to Succeed (dumps the RDB and uploads to S3).
 # wait_for_field polls to the terminal phase directly: a fast strategy Pod can
 # go Pending -> Succeeded between two observations, so an explicit "wait Running"
 # gate would flake.
-wait_for_field backupjob "$BACKUPJOB_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600
+wait_for_field backupjob "$BACKUPJOB_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600 Failed
 
 backup_ref=$(kubectl -n "$NAMESPACE" get backupjob "$BACKUPJOB_NAME" -o jsonpath='{.status.backupRef.name}')
 [[ -n "$backup_ref" ]] || { log_error "BackupJob succeeded but BackupRef is empty"; exit 1; }

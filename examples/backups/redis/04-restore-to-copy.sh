@@ -43,7 +43,7 @@ spec:
 EOF
 
 log_substep "Waiting for to-copy RestoreJob to Succeed..."
-wait_for_field restorejob "$RESTOREJOB_TOCOPY_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600
+wait_for_field restorejob "$RESTOREJOB_TOCOPY_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600 Failed
 
 log_substep "Verifying the marker landed on the copy..."
 got=$(redis_cmd "$REDIS_RESTORE_NAME" GET "$MARKER_KEY")

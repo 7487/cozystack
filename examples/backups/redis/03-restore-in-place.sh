@@ -31,7 +31,7 @@ spec:
 EOF
 
 log_substep "Waiting for in-place RestoreJob to Succeed..."
-wait_for_field restorejob "$RESTOREJOB_INPLACE_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600
+wait_for_field restorejob "$RESTOREJOB_INPLACE_NAME" '{.status.phase}' Succeeded "$NAMESPACE" 600 Failed
 
 log_substep "Verifying the marker is restored..."
 got=$(redis_cmd "$REDIS_NAME" GET "$MARKER_KEY")
