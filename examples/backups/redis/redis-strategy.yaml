@@ -23,6 +23,13 @@ spec:
       restartPolicy: Never
       activeDeadlineSeconds: 1800
       volumes:
+        # The Redis app's own CA, mounted optionally: ca.crt lands only for a
+        # tls.enabled app, and the script keys its server-TLS path off its
+        # presence — mirrors the shipped strategy.
+        - name: redis-ca
+          secret:
+            secretName: "redis-{{ .Release.Name }}.ca-cert"
+            optional: true
         - name: s3-ca
           secret:
             secretName: redis-backup-ca
@@ -34,6 +41,9 @@ spec:
           image: "REPLACE_WITH_BACKUP_CLIENT_IMAGE"
           imagePullPolicy: IfNotPresent
           volumeMounts:
+            - name: redis-ca
+              mountPath: /etc/redis-ca
+              readOnly: true
             - name: s3-ca
               mountPath: /etc/s3-ca
               readOnly: true
@@ -84,7 +94,14 @@ spec:
               SENTINEL="rfs-redis-{{ .Release.Name }}"
               KEY="{{ .ObjectKey }}"
 
-              addr=$(redis-cli -h "${SENTINEL}" -p 26379 sentinel get-master-addr-by-name mymaster)
+              # Server-side TLS: present iff the app has tls.enabled (see the
+              # optional redis-ca mount) — mirrors the shipped strategy.
+              RTLS=""
+              if [ -f /etc/redis-ca/ca.crt ]; then
+                RTLS="--tls --cacert /etc/redis-ca/ca.crt"
+              fi
+
+              addr=$(redis-cli ${RTLS} -h "${SENTINEL}" -p 26379 sentinel get-master-addr-by-name mymaster)
               MHOST=$(echo "${addr}" | sed -n '1p')
               MPORT=$(echo "${addr}" | sed -n '2p')
               if [ -z "${MHOST}" ] || [ -z "${MPORT}" ]; then
@@ -94,9 +111,9 @@ spec:
 
               tgt() {
                 if [ -n "${REDIS_PASSWORD:-}" ]; then
-                  REDISCLI_AUTH="${REDIS_PASSWORD}" redis-cli -h "${MHOST}" -p "${MPORT}" "$@"
+                  REDISCLI_AUTH="${REDIS_PASSWORD}" redis-cli ${RTLS} -h "${MHOST}" -p "${MPORT}" "$@"
                 else
-                  redis-cli -h "${MHOST}" -p "${MPORT}" "$@"
+                  redis-cli ${RTLS} -h "${MHOST}" -p "${MPORT}" "$@"
                 fi
               }
 
