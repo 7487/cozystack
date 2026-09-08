@@ -30,8 +30,17 @@ spec:
       # so it becomes a Failed Job the driver reports, instead of a Pod the cron
       # Plan keeps stacking behind. The job-in-progress path has no other deadline.
       activeDeadlineSeconds: {{ .Values.backupStrategyController.redisBackupActiveDeadlineSeconds }}
-      {{- if .Values.backupStorage.endpointCASecretName }}
       volumes:
+        # The Redis app's own CA. The chart moves Redis and Sentinel to a
+        # TLS-only listener when the app has tls.enabled and publishes the CA at
+        # redis-<app>.ca-cert; mounting it optionally means ca.crt is present
+        # exactly when the app is TLS, and a non-TLS app leaves /etc/redis-ca
+        # empty so the script keeps its plaintext path (see the RTLS block).
+        - name: redis-ca
+          secret:
+            secretName: {{ printf "redis-{{ .Release.Name }}.ca-cert" | quote }}
+            optional: true
+        {{- if .Values.backupStorage.endpointCASecretName }}
         # Verify the S3 endpoint against this private CA when the admin points
         # endpointCASecretName at a Secret carrying ca.crt (self-signed SeaweedFS).
         # The Secret is required, not optional: a missing one must fail the Pod
@@ -39,17 +48,20 @@ spec:
         - name: s3-ca
           secret:
             secretName: {{ .Values.backupStorage.endpointCASecretName | quote }}
-      {{- end }}
+        {{- end }}
       containers:
         - name: redis-backup
           image: "{{ .Values.backupStrategyController.redisBackupClientImage }}"
           imagePullPolicy: IfNotPresent
-          {{- if .Values.backupStorage.endpointCASecretName }}
           volumeMounts:
+            - name: redis-ca
+              mountPath: /etc/redis-ca
+              readOnly: true
+            {{- if .Values.backupStorage.endpointCASecretName }}
             - name: s3-ca
               mountPath: /etc/s3-ca
               readOnly: true
-          {{- end }}
+            {{- end }}
           env:
             # Redis password, when the app has authEnabled (the default). The
             # chart emits the Secret redis-<app>-auth; mount it optionally so a
@@ -130,9 +142,21 @@ spec:
               # it in-script would collapse a Plan's history onto one object.
               KEY="{{ printf "{{ .ObjectKey }}" }}"
 
+              # Redis server-side TLS. The chart moves Redis and Sentinel to a
+              # TLS-only listener when the app has tls.enabled and publishes the
+              # trust anchor at redis-<app>.ca-cert; that Secret is mounted
+              # optionally, so ca.crt exists here iff the app is TLS. Verify both
+              # the Sentinel and the master connection against it. authClients:
+              # yes (mutual TLS) is out of scope — the platform issues no client
+              # certificate — but is off by default.
+              RTLS=""
+              if [ -f /etc/redis-ca/ca.crt ]; then
+                RTLS="--tls --cacert /etc/redis-ca/ca.crt"
+              fi
+
               # Discover the current master via any sentinel — the RedisFailover
               # master moves on failover, so a fixed host would break after one.
-              addr=$(redis-cli -h "${SENTINEL}" -p 26379 sentinel get-master-addr-by-name mymaster)
+              addr=$(redis-cli ${RTLS} -h "${SENTINEL}" -p 26379 sentinel get-master-addr-by-name mymaster)
               MHOST=$(echo "${addr}" | sed -n '1p')
               MPORT=$(echo "${addr}" | sed -n '2p')
               if [ -z "${MHOST}" ] || [ -z "${MPORT}" ]; then
@@ -148,9 +172,9 @@ spec:
               # must NOT inherit this — hence a per-call wrapper, not an export.
               tgt() {
                 if [ -n "${REDIS_PASSWORD:-}" ]; then
-                  REDISCLI_AUTH="${REDIS_PASSWORD}" redis-cli -h "${MHOST}" -p "${MPORT}" "$@"
+                  REDISCLI_AUTH="${REDIS_PASSWORD}" redis-cli ${RTLS} -h "${MHOST}" -p "${MPORT}" "$@"
                 else
-                  redis-cli -h "${MHOST}" -p "${MPORT}" "$@"
+                  redis-cli ${RTLS} -h "${MHOST}" -p "${MPORT}" "$@"
                 fi
               }
 

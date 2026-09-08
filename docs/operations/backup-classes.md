@@ -129,6 +129,8 @@ The bucket lives in `tenant-root` and is provisioned through the `apps.cozystack
 
 The Redis dump Job additionally reads the `endpoint`, `bucketName`, and `region` keys (alongside the `AWS_*` pair) via `secretKeyRef`, the same set the ClickHouse sidecar consumes.
 
+The dump Job also speaks to the Redis app's own Sentinel and master, which is a separate TLS axis from the S3 endpoint above. When the `Redis` app has `tls.enabled`, the operator moves both to a TLS-only listener and publishes the CA at `redis-<app>.ca-cert`; the Job mounts that Secret optionally and connects with `--tls --cacert` exactly when its `ca.crt` is present, so a plaintext (non-TLS) app is unaffected. This covers the default `tls.authClients: no`. Mutual TLS (`authClients: yes`) is not supported for backup — it requires a client certificate signed by the release CA, which the platform does not issue.
+
 ### Bootstrap window
 
 On a fresh-cluster install, the Velero `BackupStorageLocation` `cozy-default` is rendered before the credentials projector has had a chance to copy `cozy-backups-creds` into `cozy-velero`. The BSL reports `Unavailable` until the projector's first synchronous round completes (which runs as soon as the `backupstrategy-controller` acquires leadership — in practice moments after the Pod becomes Ready, typically tens of seconds after `helm install` returns, not minutes). Velero rejects new `Backup` AND `Restore` requests against `storageLocation: cozy-default` during that window. Plan VM backup automation accordingly, or wait for the BSL to become ready before submitting backups: `kubectl -n cozy-velero wait backupstoragelocation cozy-default --for=jsonpath='{.status.phase}'=Available --timeout=5m`.

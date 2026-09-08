@@ -17,12 +17,29 @@ set:
   backupStorage.bucketNameOverride: test-bucket
 
 tests:
-  - it: "default: no CA volume, skip-verify off, deadline set, S3 refs optional"
+  - it: "default: app CA mounted optionally (server-TLS auto-detect), no S3 CA, skip-verify off, deadline set, S3 refs optional"
     asserts:
-      - notExists:
+      # The Redis app's CA is always mounted, but optionally: ca.crt lands only
+      # for a TLS-enabled app, and the script keys its server-TLS path off that
+      # file's presence. Its absence must not fail the Pod.
+      - contains:
           path: spec.template.spec.volumes
-      - notExists:
+          content:
+            name: redis-ca
+            secret:
+              secretName: "redis-{{ .Release.Name }}.ca-cert"
+              optional: true
+      - contains:
           path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: redis-ca
+            mountPath: /etc/redis-ca
+            readOnly: true
+      # No S3-endpoint CA volume unless endpointCASecretName is set.
+      - notContains:
+          path: spec.template.spec.volumes
+          content:
+            name: s3-ca
       - contains:
           path: spec.template.spec.containers[0].env
           content:
@@ -53,10 +70,11 @@ tests:
             name: s3-ca
             secret:
               secretName: my-s3-ca
-      # The Secret must be required: a missing CA has to fail the Pod, never
-      # silently fall through to skip-verify.
+      # The S3 CA (volumes[1], after the always-present redis-ca) must be
+      # required: a missing CA has to fail the Pod, never silently fall through
+      # to skip-verify.
       - notExists:
-          path: spec.template.spec.volumes[0].secret.optional
+          path: spec.template.spec.volumes[1].secret.optional
       - contains:
           path: spec.template.spec.containers[0].volumeMounts
           content:
