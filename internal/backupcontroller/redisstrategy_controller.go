@@ -278,10 +278,15 @@ func (r *BackupJobReconciler) reconcileRedis(ctx context.Context, j *backupsv1al
 	// created, observe it directly (via the switch below): re-checking readiness
 	// here would mark a run Failed whose Job may already have completed, if the
 	// app's Ready flips False after launch and stays so past the deadline (an
-	// unrelated HelmRelease blip). The deadline still bounds the pre-launch wait.
+	// unrelated HelmRelease blip). Only a definite NotFound means "not created
+	// yet"; any other Get error is undecidable, so requeue rather than re-gate
+	// readiness on it (a transient error must not reintroduce the spurious fail).
+	// The deadline still bounds the pre-launch wait.
 	existingBackupJob := &batchv1.Job{}
-	jobPreexists := r.Get(ctx, client.ObjectKey{Namespace: j.Namespace, Name: jobNameForBackupJob(j)}, existingBackupJob) == nil
-	if !jobPreexists {
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: j.Namespace, Name: jobNameForBackupJob(j)}, existingBackupJob); {
+	case err == nil:
+		// Job exists; skip the readiness re-gate and observe it below.
+	case apierrors.IsNotFound(err):
 		if proceed, reason, message := redisAppReady(app); !proceed {
 			if redisBackupDeadlineExceeded(j.Status.StartedAt) {
 				return r.markBackupJobFailed(ctx, j, fmt.Sprintf(
@@ -299,6 +304,8 @@ func (r *BackupJobReconciler) reconcileRedis(ctx context.Context, j *backupsv1al
 			}
 			return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 		}
+	default:
+		return ctrl.Result{}, err
 	}
 
 	objectKey := redisObjectKey(j.Namespace, j.Spec.ApplicationRef.Name, j.Name)
@@ -568,9 +575,13 @@ func (r *RestoreJobReconciler) reconcileRedisRestore(ctx context.Context, restor
 	// Gate on target readiness only before the restore Job exists (see the
 	// backup path): once created, the Job is observed directly, so a post-launch
 	// Ready flip cannot spuriously fail a restore whose Job may have completed.
+	// Only a definite NotFound means "not created yet"; any other Get error is
+	// undecidable, so requeue rather than re-gate readiness on it.
 	existingRestoreJob := &batchv1.Job{}
-	restoreJobPreexists := r.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: jobNameForRestoreJob(restoreJob)}, existingRestoreJob) == nil
-	if !restoreJobPreexists {
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: jobNameForRestoreJob(restoreJob)}, existingRestoreJob); {
+	case err == nil:
+		// Job exists; skip the readiness re-gate and observe it below.
+	case apierrors.IsNotFound(err):
 		if proceed, reason, message := redisAppReady(app); !proceed {
 			if redisBackupDeadlineExceeded(restoreJob.Status.StartedAt) {
 				return r.markRestoreJobFailed(ctx, restoreJob, fmt.Sprintf(
@@ -588,6 +599,8 @@ func (r *RestoreJobReconciler) reconcileRedisRestore(ctx context.Context, restor
 			}
 			return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 		}
+	default:
+		return ctrl.Result{}, err
 	}
 
 	rendered, err := renderRedisTemplate(
