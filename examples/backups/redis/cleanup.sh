@@ -16,4 +16,12 @@ kubectl -n "$NAMESPACE" delete backup "$BACKUPJOB_NAME" --ignore-not-found
 kubectl -n "$NAMESPACE" delete redis "$REDIS_RESTORE_NAME" --ignore-not-found
 kubectl -n "$NAMESPACE" delete redis "$REDIS_NAME" --ignore-not-found
 
+# Demo-owned backups plumbing: the BackupClass and strategy CR are cluster-scoped
+# (no -n). Deleting the Bucket releases its S3 objects and the projected keys.
+kubectl delete backupclass "$BACKUPCLASS_NAME" --ignore-not-found
+kubectl delete redis.strategy.backups.cozystack.io "$STRATEGY_NAME" --ignore-not-found
+kubectl -n "$NAMESPACE" delete secret "$CREDS_SECRET" --ignore-not-found
+kubectl -n "$NAMESPACE" delete secret "$CA_SECRET" --ignore-not-found
+kubectl -n "$NAMESPACE" delete bucket "$BUCKET_NAME" --ignore-not-found
+
 log_success "Cleanup complete."
