@@ -274,22 +274,31 @@ func (r *BackupJobReconciler) reconcileRedis(ctx context.Context, j *backupsv1al
 		return ctrl.Result{}, err
 	}
 
-	if proceed, reason, message := redisAppReady(app); !proceed {
-		if redisBackupDeadlineExceeded(j.Status.StartedAt) {
-			return r.markBackupJobFailed(ctx, j, fmt.Sprintf(
-				"Redis application %s/%s not ready within %s (%s: %s)",
-				j.Namespace, j.Spec.ApplicationRef.Name, redisDefaultBackupDeadline, reason, message))
+	// Gate on application readiness only before the Job exists. Once it has been
+	// created, observe it directly (via the switch below): re-checking readiness
+	// here would mark a run Failed whose Job may already have completed, if the
+	// app's Ready flips False after launch and stays so past the deadline (an
+	// unrelated HelmRelease blip). The deadline still bounds the pre-launch wait.
+	existingBackupJob := &batchv1.Job{}
+	jobPreexists := r.Get(ctx, client.ObjectKey{Namespace: j.Namespace, Name: jobNameForBackupJob(j)}, existingBackupJob) == nil
+	if !jobPreexists {
+		if proceed, reason, message := redisAppReady(app); !proceed {
+			if redisBackupDeadlineExceeded(j.Status.StartedAt) {
+				return r.markBackupJobFailed(ctx, j, fmt.Sprintf(
+					"Redis application %s/%s not ready within %s (%s: %s)",
+					j.Namespace, j.Spec.ApplicationRef.Name, redisDefaultBackupDeadline, reason, message))
+			}
+			apimeta.SetStatusCondition(&j.Status.Conditions, metav1.Condition{
+				Type:    "Ready",
+				Status:  metav1.ConditionFalse,
+				Reason:  "ApplicationNotReady",
+				Message: fmt.Sprintf("Redis application %s/%s is not ready (%s: %s)", j.Namespace, j.Spec.ApplicationRef.Name, reason, message),
+			})
+			if updateErr := r.Status().Update(ctx, j); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 		}
-		apimeta.SetStatusCondition(&j.Status.Conditions, metav1.Condition{
-			Type:    "Ready",
-			Status:  metav1.ConditionFalse,
-			Reason:  "ApplicationNotReady",
-			Message: fmt.Sprintf("Redis application %s/%s is not ready (%s: %s)", j.Namespace, j.Spec.ApplicationRef.Name, reason, message),
-		})
-		if updateErr := r.Status().Update(ctx, j); updateErr != nil {
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 	}
 
 	objectKey := redisObjectKey(j.Namespace, j.Spec.ApplicationRef.Name, j.Name)
@@ -556,22 +565,29 @@ func (r *RestoreJobReconciler) reconcileRedisRestore(ctx context.Context, restor
 		return ctrl.Result{}, err
 	}
 
-	if proceed, reason, message := redisAppReady(app); !proceed {
-		if redisBackupDeadlineExceeded(restoreJob.Status.StartedAt) {
-			return r.markRestoreJobFailed(ctx, restoreJob, fmt.Sprintf(
-				"target Redis application %s/%s not ready within %s (%s: %s)",
-				targetNamespace, targetAppName, redisDefaultBackupDeadline, reason, message))
+	// Gate on target readiness only before the restore Job exists (see the
+	// backup path): once created, the Job is observed directly, so a post-launch
+	// Ready flip cannot spuriously fail a restore whose Job may have completed.
+	existingRestoreJob := &batchv1.Job{}
+	restoreJobPreexists := r.Get(ctx, client.ObjectKey{Namespace: targetNamespace, Name: jobNameForRestoreJob(restoreJob)}, existingRestoreJob) == nil
+	if !restoreJobPreexists {
+		if proceed, reason, message := redisAppReady(app); !proceed {
+			if redisBackupDeadlineExceeded(restoreJob.Status.StartedAt) {
+				return r.markRestoreJobFailed(ctx, restoreJob, fmt.Sprintf(
+					"target Redis application %s/%s not ready within %s (%s: %s)",
+					targetNamespace, targetAppName, redisDefaultBackupDeadline, reason, message))
+			}
+			apimeta.SetStatusCondition(&restoreJob.Status.Conditions, metav1.Condition{
+				Type:    "Ready",
+				Status:  metav1.ConditionFalse,
+				Reason:  "ApplicationNotReady",
+				Message: fmt.Sprintf("target Redis application %s/%s is not ready (%s: %s)", targetNamespace, targetAppName, reason, message),
+			})
+			if updateErr := r.Status().Update(ctx, restoreJob); updateErr != nil {
+				return ctrl.Result{}, updateErr
+			}
+			return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 		}
-		apimeta.SetStatusCondition(&restoreJob.Status.Conditions, metav1.Condition{
-			Type:    "Ready",
-			Status:  metav1.ConditionFalse,
-			Reason:  "ApplicationNotReady",
-			Message: fmt.Sprintf("target Redis application %s/%s is not ready (%s: %s)", targetNamespace, targetAppName, reason, message),
-		})
-		if updateErr := r.Status().Update(ctx, restoreJob); updateErr != nil {
-			return ctrl.Result{}, updateErr
-		}
-		return ctrl.Result{RequeueAfter: redisPollInterval}, nil
 	}
 
 	rendered, err := renderRedisTemplate(

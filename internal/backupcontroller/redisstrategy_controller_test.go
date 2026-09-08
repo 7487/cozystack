@@ -5,6 +5,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -316,6 +317,60 @@ func TestReconcileRedis_CompletesAndCreatesBackup(t *testing.T) {
 	wantKey := "tenant-test/cache/test-bj.rdb"
 	if got := created.Spec.DriverMetadata[redisObjectMetaKey]; got != wantKey {
 		t.Errorf("expected recorded object %q, got %q", wantKey, got)
+	}
+}
+
+// TestReconcileRedis_ReadinessNotRegatedAfterJobExists pins that once the backup
+// Job exists, a subsequent app Ready=False (past the deadline) does NOT mark the
+// run Failed — the completed Job is observed directly. Dropping the
+// jobPreexists guard makes the readiness gate fire and turns this RED.
+func TestReconcileRedis_ReadinessNotRegatedAfterJobExists(t *testing.T) {
+	app := newRedisApp("cache", "tenant-test")
+	// App went not-Ready after the Job was launched (e.g. an unrelated
+	// HelmRelease blip), and stayed so past the deadline.
+	app.Object["status"] = map[string]any{
+		"conditions": []any{
+			map[string]any{"type": "Ready", "status": "False", "reason": "HelmUpgradeFailed", "message": "blip"},
+		},
+	}
+	strategy := newRedisStrategy("redis-strategy")
+	stale := metav1.NewTime(time.Now().Add(-(redisDefaultBackupDeadline + time.Minute)))
+	backupJob := &backupsv1alpha1.BackupJob{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-bj", Namespace: "tenant-test"},
+		Spec: backupsv1alpha1.BackupJobSpec{
+			ApplicationRef:  newRedisAppRef("cache"),
+			BackupClassName: "cozy-default",
+		},
+		Status: backupsv1alpha1.BackupJobStatus{StartedAt: &stale, Phase: backupsv1alpha1.BackupJobPhaseRunning},
+	}
+	completedK8sJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      jobNameForBackupJob(backupJob),
+			Namespace: backupJob.Namespace,
+			Labels: map[string]string{
+				backupsv1alpha1.OwningJobNameLabel:      backupJob.Name,
+				backupsv1alpha1.OwningJobNamespaceLabel: backupJob.Namespace,
+			},
+		},
+		Status: batchv1.JobStatus{
+			CompletionTime: &stale,
+			Conditions:     []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}},
+		},
+	}
+	resolved := newRedisResolved("redis-strategy", map[string]string{"bucketName": "redis-bucket"})
+
+	r, _ := newRedisTestEnv(t, app, clientfake.NewClientBuilder().WithObjects(backupJob, strategy, completedK8sJob))
+	ctx := context.Background()
+
+	if _, err := r.reconcileRedis(ctx, backupJob, resolved); err != nil {
+		t.Fatalf("reconcileRedis() error = %v", err)
+	}
+	updated := &backupsv1alpha1.BackupJob{}
+	if err := r.Get(ctx, client.ObjectKeyFromObject(backupJob), updated); err != nil {
+		t.Fatalf("get backupjob: %v", err)
+	}
+	if updated.Status.Phase != backupsv1alpha1.BackupJobPhaseSucceeded {
+		t.Fatalf("expected Succeeded (Job already complete; readiness must not be re-gated), got %q", updated.Status.Phase)
 	}
 }
 
